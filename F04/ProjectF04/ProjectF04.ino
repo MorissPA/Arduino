@@ -12,6 +12,9 @@
 #define PCA9685_MODE1     0x00  // Rejestr konfiguracyjny 1
 #define PCA9685_LED0_ON_L 0x06  // Rejestr bazowy dla pierwszego kanału (Kanał 0)
 
+/* Zabezpieczenie FMEA - limit pętli, aby uniknąć nieskończonego zawieszenia I2C */
+#define I2C_TIMEOUT       10000 
+
 // =====================================================================
 //                       OBSŁUGA I2C (TWI)
 // =====================================================================
@@ -33,12 +36,17 @@ void twi_init(void) {
 }
 
 /*!
- * @brief    Wysyła warunek START na magistralę I2C.
+ * @brief    Wysyła warunek START na magistralę I2C. Zwraca false w razie błędu.
  */
-void twi_start(void) {
+bool twi_start(void) {
+    uint16_t timeout = 0;
     TWCR = (1 << TWINT) | (1 << TWSTA) | (1 << TWEN);
-    /* Czekaj na ustawienie flagi TWINT (zakończenie operacji) */
-    while (!(TWCR & (1 << TWINT)));
+    
+    /* Czekaj na ustawienie flagi TWINT (zakończenie operacji) lub przerwij po czasie */
+    while (!(TWCR & (1 << TWINT))) {
+        if (++timeout > I2C_TIMEOUT) return false;
+    }
+    return true;
 }
 
 /*!
@@ -49,14 +57,19 @@ void twi_stop(void) {
 }
 
 /*!
- * @brief    Wysyła jeden bajt danych przez interfejs TWI.
+ * @brief    Wysyła jeden bajt danych przez interfejs TWI. Zwraca false w razie błędu.
  * @param data Bajt do wysłania.
  */
-void twi_write(uint8_t data) {
+bool twi_write(uint8_t data) {
+    uint16_t timeout = 0;
     TWDR = data;
     TWCR = (1 << TWINT) | (1 << TWEN);
-    /* Czekaj na potwierdzenie wysłania */
-    while (!(TWCR & (1 << TWINT)));
+    
+    /* Czekaj na potwierdzenie wysłania lub przerwij po czasie */
+    while (!(TWCR & (1 << TWINT))) {
+        if (++timeout > I2C_TIMEOUT) return false;
+    }
+    return true;
 }
 
 
@@ -68,7 +81,8 @@ void twi_write(uint8_t data) {
  * @brief    Wybudza i inicjalizuje kontroler PCA9685.
  */
 void pca9685_init(void) {
-    twi_start();
+    if (!twi_start()) return; // Zabezpieczenie FMEA
+    
     /* Wysłanie adresu z bitem zapisu (SLA+W). Adres przesunięty w lewo o 1 bit. */
     twi_write((PCA9685_ADDR << 1) | 0); 
     
@@ -84,7 +98,8 @@ void pca9685_init(void) {
  * @param off Czas wyłączenia w cyklu 0-4095
  */
 void pca9685_set_pwm(uint8_t channel, uint16_t on, uint16_t off) {
-    twi_start();
+    if (!twi_start()) return; // Zabezpieczenie FMEA
+    
     twi_write((PCA9685_ADDR << 1) | 0);
     
     /* Dzięki Auto-Increment, zapisujemy 4 kolejne rejestry za jednym zamachem */
@@ -132,37 +147,42 @@ void uart_transmit_string(const char* str) {
 
 
 // =====================================================================
-//                       PĘTLA GŁÓWNA
+//                       GŁÓWNY PROGRAM
 // =====================================================================
 
-void setup() {
-    /* Inicjalizacja sprzętowa na poziomie rejestrów */
+int main(void) {
+    /* Inicjalizacja sprzętowa na poziomie rejestrów (dawne setup) */
     init_uart_bluetooth(MY_UBRR);
     twi_init();       // Inicjalizacja I2C (TWI)
     pca9685_init();   // Inicjalizacja modułu LED
-}
 
-void loop() {
     uint8_t command_received = 0;
 
-    /* Metoda odpytywania (Polling) - sprawdź czy nadeszły dane z HC-05 */
-    if (uart_data_available()) {
+    /* Pętla nieskończona programu */
+    while (1) {
         
-        command_received = uart_receive_char();
+        /* Metoda odpytywania (Polling) */
+        if (uart_data_available()) {
+            
+            command_received = uart_receive_char();
 
-        /* Analiza komendy i sterowanie modułem PCA9685 (Kanał 0) */
-        if (command_received == '1') {
-            /* Włącz diodę na maxa: ON na takcie 0, OFF na takcie 4095 */
-            pca9685_set_pwm(0, 0, 4095); 
-            uart_transmit_string("Dioda PCA9685: WLACZONA\r\n");
-        } 
-        else if (command_received == '0') {
-            /* Wyłącz diodę: ON na takcie 0, OFF na takcie 0 */
-            pca9685_set_pwm(0, 0, 0); 
-            uart_transmit_string("Dioda PCA9685: WYLACZONA\r\n");
+            /* Analiza komendy i sterowanie modułem PCA9685 (Kanał 0) */
+            if (command_received == '1') {
+                /* Włącz diodę na maxa: ON na takcie 0, OFF na takcie 4095 */
+                pca9685_set_pwm(0, 0, 4095); 
+                uart_transmit_string("Dioda PCA9685: WLACZONA\r\n");
+            } 
+            else if (command_received == '0') {
+                /* Wyłącz diodę: ON na takcie 0, OFF na takcie 0 */
+                pca9685_set_pwm(0, 0, 0); 
+                uart_transmit_string("Dioda PCA9685: WYLACZONA\r\n");
+            }
+            else {
+                uart_transmit_string("Nierozpoznana komenda!\r\n");
+            }
         }
-        else {
-            uart_transmit_string("Nierozpoznana komenda!\r\n");
-        }
+        
     }
+
+    return 0; 
 }
