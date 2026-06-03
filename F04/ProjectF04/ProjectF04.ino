@@ -368,6 +368,45 @@ static long sr04_measure(void) {
 }
 
 /* ================================================================
+   CZUJNIK HALLA — Pomiar RPM (Przerwanie INT4)
+   Czujnik: Tesla MH3SS2. Sygnal podłączony do PE4 = Pin 2
+   ================================================================ */
+static volatile uint16_t impulsy_halla = 0;
+static uint32_t czas_rpm = 0;
+static uint16_t aktualne_rpm = 0;
+
+/**
+ * @brief Przerwanie zewnętrzne INT4 (Pin 2 / PE4).
+ * Wywoływane sprzętowo przy każdym zboczu opadającym (wykrycie magnesu).
+ */
+ISR(INT4_vect) {
+    impulsy_halla++;
+}
+
+/**
+ * @brief Inicjalizacja pinu i rejestrów przerwania zewnętrznego INT4.
+ */
+static void hall_init(void) {
+    // 1. Konfiguracja pinu PE4 (Pin 2) jako wejście
+    DDRE &= ~(1 << PE4);
+    
+    // 2. Włączenie wewnętrznego rezystora Pull-up
+    // (Wymagane dla czujników typu Open-Collector jak MH3SS2)
+    PORTE |= (1 << PE4);
+    
+    // 3. Konfiguracja wyzwalania przerwania (Rejestr EICRB dla INT7:4)
+    // ISC41 = 1, ISC40 = 0 -> wyzwalanie na zboczu opadającym (Falling Edge)
+    EICRB |= (1 << ISC41);
+    EICRB &= ~(1 << ISC40);
+    
+    // 4. Wyczyszczenie ewentualnych starych flag przerwań
+    EIFR = (1 << INTF4);
+    
+    // 5. Włączenie maski przerwania dla INT4 w rejestrze EIMSK
+    EIMSK |= (1 << INT4);
+}
+
+/* ================================================================
    SILNIKI
    PA0=IN1 PA1=IN2 PA2=IN3 PA3=IN4 PA4=IN5 PA5=IN6 PA6=IN7 PA7=IN8
    ================================================================ */
@@ -558,7 +597,7 @@ static uint32_t czas_pomiaru   = 0;
 static uint32_t czas_ostatniego_pikniecia = 0;
 
 static long     odleglosc_cm   = 999L;
-static long     prev_odleglosc = -1L;
+static long     prev_rpm       = 0xFFFF;
 
 static char aktualny_kierunek[17] = "STOP";
 static char prev_kierunek[17]     = "";
@@ -574,16 +613,12 @@ static void lcd_update(void) {
         lcd_puts_pad(aktualny_kierunek);
         strcpy(prev_kierunek, aktualny_kierunek);
     }
-    if (odleglosc_cm != prev_odleglosc) {
+    if (aktualne_rpm != prev_rpm) {
         lcd_goto(0, 1);
-        if (odleglosc_cm >= 999L) {
-            lcd_puts("Odl: poza zasieg");
-        } else {
-            lcd_puts("Odl: ");
-            lcd_putn(odleglosc_cm);
-            lcd_puts(" cm         ");
-        }
-        prev_odleglosc = odleglosc_cm;
+        lcd_puts("RPM: ");
+        lcd_putn((int32_t)aktualne_rpm);
+        lcd_puts("       "); // Puste spacje, aby nadpisać ewentualne stare, dłuższe liczby
+        prev_rpm = aktualne_rpm;
     }
 }
 
@@ -739,6 +774,29 @@ int main(void) {
                     // Nastepne wlaczenie nastapi za (interwal - 80) ms
                 }
             }
+        }
+
+        /* 5. Obliczanie RPM z czujnika Halla (co 1000 ms) */
+        if (teraz - czas_rpm >= 1000) {
+            czas_rpm = teraz;
+            
+            uint16_t kopia_impulsow;
+            
+            // BLOK OPERACJI ATOMOWEJ
+            // Zabezpieczenie przed wywołaniem przerwania sprzętowego 
+            // w trakcie kopiowania 16-bitowej zmiennej do rejestrów roboczych.
+            uint8_t stary_sreg = SREG;
+            cli();
+            kopia_impulsow = impulsy_halla;
+            impulsy_halla = 0; // zerujemy sprzętowy licznik na kolejną sekundę
+            SREG = stary_sreg;
+            
+            // Fizyka zjawiska: Zakładając 1 magnes na osi koła, 1 impuls to 1 obrót.
+            // W ciągu 1 sekundy wykonano 'kopia_impulsow' obrotów.
+            // Mnożymy to razy 60, aby uzyskać RPM (obroty na minutę).
+            aktualne_rpm = kopia_impulsow * 60;
+            
+            lcd_update();
         }
 
         /* miganie kierunkowskazow i awaryjnych */
