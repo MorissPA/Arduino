@@ -1,188 +1,548 @@
+/*
+ * SAMOCHODZIK — Bare Metal ATmega2560
+ * Bluetooth HC-05 + 2x L298N + LCD I2C + HC-SR04 + Buzzer + LED + PCA9685
+ *
+ * Piny:
+ *   HC-05:    UART1 TX=Pin19(PD3) RX=Pin18(PD2)
+ *   L298N #1: ENA=Pin5(PE3/OC3A) IN1=22(PA0) IN2=23(PA1)
+ *             ENB=Pin6(PH3/OC4A) IN3=24(PA2) IN4=25(PA3)
+ *   L298N #2: ENC=Pin7(PH4/OC4B) IN5=26(PA4) IN6=27(PA5)
+ *             END=Pin8(PH5/OC4C) IN7=28(PA6) IN8=29(PA7)
+ *   LCD I2C:  SDA=Pin20 SCL=Pin21, PCF8574T addr=0x27
+ *   PCA9685:  ten sam I2C, addr=0x40, kanalY 0-3
+ *   HC-SR04:  TRIG=Pin38(PD7) ECHO=Pin40(PG1)
+ *   Buzzer:   Pin44(PL5/OC5C)
+ *   LED:      Pin46(PL3)
+ *
+ * Timery:
+ *   Timer0: CTC 1ms -> millis()
+ *   Timer1: pomiar HC-SR04 (chwilowy)
+ *   Timer3: Fast PWM 8-bit -> ENA (Pin5)
+ *   Timer4: Fast PWM 8-bit -> ENB(6) ENC(7) END(8)
+ *   Timer5: CTC toggle -> ton buzzera (Pin44)
+ */
+
 #include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/delay.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
-/* --- Definicje dla UART --- */
 #define F_CPU 16000000UL
-#define BAUD 9600
-#define MY_UBRR (F_CPU/16/BAUD-1)
 
-/* --- Definicje dla PCA9685 (I2C) --- */
-#define PCA9685_ADDR      0x40  // Domyślny 7-bitowy adres I2C modułu PCA9685
-#define PCA9685_MODE1     0x00  // Rejestr konfiguracyjny 1
-#define PCA9685_LED0_ON_L 0x06  // Rejestr bazowy dla pierwszego kanału (Kanał 0)
+/* ================================================================
+   MILLIS — Timer0 CTC
+   Prescaler 64, OCR0A=249 -> 250 ticków x 4us = 1ms
+   TCCR0A: WGM01=1 (CTC)
+   TCCR0B: CS01|CS00 (prescaler 64)
+   ================================================================ */
+volatile uint32_t ms_count = 0;
 
-/* Zabezpieczenie FMEA - limit pętli, aby uniknąć nieskończonego zawieszenia I2C */
-#define I2C_TIMEOUT       10000 
-
-// =====================================================================
-//                       OBSŁUGA I2C (TWI)
-// =====================================================================
-
-/*!
- * @brief    Inicjalizuje sprzętowy interfejs TWI (I2C).
- * @side effects: Ustawia prędkość zegara SCL na 100 kHz. Włącza moduł TWI.
- */
-void twi_init(void) {
-    /* Ustawienie preskalera na 1 (TWPS1=0, TWPS0=0) */
-    TWSR = 0x00; 
-    
-    /* Obliczenie wartości dla 100 kHz: SCL = F_CPU / (16 + 2*TWBR*Prescaler) 
-       16000000 / (16 + 2*72*1) = 100000 Hz */
-    TWBR = 72;   
-    
-    /* Włączenie interfejsu TWI */
-    TWCR = (1 << TWEN); 
+ISR(TIMER0_COMPA_vect) {
+    ms_count++;
 }
 
-/*!
- * @brief    Wysyła warunek START na magistralę I2C. Zwraca false w razie błędu.
- */
-bool twi_start(void) {
-    uint16_t timeout = 0;
-    TWCR = (1 << TWINT) | (1 << TWSTA) | (1 << TWEN);
-    
-    /* Czekaj na ustawienie flagi TWINT (zakończenie operacji) lub przerwij po czasie */
-    while (!(TWCR & (1 << TWINT))) {
-        if (++timeout > I2C_TIMEOUT) return false;
-    }
-    return true;
+static void timer0_init(void) {
+    TCCR0A = (1 << WGM01);
+    TCCR0B = (1 << CS01) | (1 << CS00);
+    OCR0A  = 249;
+    TIMSK0 = (1 << OCIE0A);
 }
 
-/*!
- * @brief    Wysyła warunek STOP na magistralę I2C.
- */
-void twi_stop(void) {
-    TWCR = (1 << TWINT) | (1 << TWEN) | (1 << TWSTO);
+static uint32_t millis(void) {
+    uint32_t t;
+    uint8_t sreg = SREG;
+    cli();
+    t = ms_count;
+    SREG = sreg;
+    return t;
 }
 
-/*!
- * @brief    Wysyła jeden bajt danych przez interfejs TWI. Zwraca false w razie błędu.
- * @param data Bajt do wysłania.
- */
-bool twi_write(uint8_t data) {
-    uint16_t timeout = 0;
-    TWDR = data;
-    TWCR = (1 << TWINT) | (1 << TWEN);
-    
-    /* Czekaj na potwierdzenie wysłania lub przerwij po czasie */
-    while (!(TWCR & (1 << TWINT))) {
-        if (++timeout > I2C_TIMEOUT) return false;
-    }
-    return true;
+/* ================================================================
+   UART0 (USB monitor) + UART1 (HC-05 Bluetooth)
+   UBRR = F_CPU / (16 x BAUD) - 1 = 103 dla 9600 baud @ 16MHz
+   UCSR1C: UCSZ11|UCSZ10 = format 8N1
+   ================================================================ */
+#define BAUD     9600UL
+#define UBRR_VAL (F_CPU / (16UL * BAUD) - 1)
+
+static void uart0_init(void) {
+    UBRR0H = (uint8_t)(UBRR_VAL >> 8);
+    UBRR0L = (uint8_t)(UBRR_VAL);
+    UCSR0B = (1 << RXEN0) | (1 << TXEN0);
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
 }
 
+static bool    uart0_available(void) { return (UCSR0A & (1 << RXC0)); }
+static uint8_t uart0_read(void)      { return UDR0; }
+static void    uart0_putc(char c)    { while (!(UCSR0A & (1 << UDRE0))); UDR0 = c; }
+static void    uart0_puts(const char *s) { while (*s) uart0_putc(*s++); }
 
-// =====================================================================
-//                       OBSŁUGA PCA9685
-// =====================================================================
-
-/*!
- * @brief    Wybudza i inicjalizuje kontroler PCA9685.
- */
-void pca9685_init(void) {
-    if (!twi_start()) return; // Zabezpieczenie FMEA
-    
-    /* Wysłanie adresu z bitem zapisu (SLA+W). Adres przesunięty w lewo o 1 bit. */
-    twi_write((PCA9685_ADDR << 1) | 0); 
-    
-    twi_write(PCA9685_MODE1); // Wybór rejestru MODE1
-    twi_write(0x21);          // AI=1 (Auto-Increment włączony), wybudzenie ze snu
-    twi_stop();
-}
-
-/*!
- * @brief    Ustawia sygnał PWM dla konkretnego kanału.
- * @param channel Numer kanału (0 do 15)
- * @param on Czas włączenia w cyklu 0-4095
- * @param off Czas wyłączenia w cyklu 0-4095
- */
-void pca9685_set_pwm(uint8_t channel, uint16_t on, uint16_t off) {
-    if (!twi_start()) return; // Zabezpieczenie FMEA
-    
-    twi_write((PCA9685_ADDR << 1) | 0);
-    
-    /* Dzięki Auto-Increment, zapisujemy 4 kolejne rejestry za jednym zamachem */
-    twi_write(PCA9685_LED0_ON_L + 4 * channel); 
-    twi_write(on & 0xFF);        // ON_L
-    twi_write(on >> 8);          // ON_H
-    twi_write(off & 0xFF);       // OFF_L
-    twi_write(off >> 8);         // OFF_H
-    
-    twi_stop();
-}
-
-
-// =====================================================================
-//                       OBSŁUGA UART (Bluetooth)
-// =====================================================================
-
-void init_uart_bluetooth(uint16_t baudrate_register_value) {
-    UBRR1H = (uint8_t)(baudrate_register_value >> 8);
-    UBRR1L = (uint8_t)baudrate_register_value;
+static void uart1_init(void) {
+    UBRR1H = (uint8_t)(UBRR_VAL >> 8);
+    UBRR1L = (uint8_t)(UBRR_VAL);
     UCSR1B = (1 << RXEN1) | (1 << TXEN1);
     UCSR1C = (1 << UCSZ11) | (1 << UCSZ10);
 }
 
-bool uart_data_available(void) {
-    return (UCSR1A & (1 << RXC1));
+static bool    uart1_available(void) { return (UCSR1A & (1 << RXC1)); }
+static uint8_t uart1_read(void)      { return UDR1; }
+static void    uart1_putc(char c)    { while (!(UCSR1A & (1 << UDRE1))); UDR1 = c; }
+static void    uart1_puts(const char *s) { while (*s) uart1_putc(*s++); }
+
+static void uart_putn(uint8_t port, int32_t n) {
+    char buf[12]; int8_t i = 0;
+    if (n < 0) { (port==0 ? uart0_putc : uart1_putc)('-'); n = -n; }
+    if (n == 0) { (port==0 ? uart0_putc : uart1_putc)('0'); return; }
+    while (n > 0) { buf[i++] = '0' + (n % 10); n /= 10; }
+    while (i > 0) { i--; (port==0 ? uart0_putc : uart1_putc)(buf[i]); }
 }
 
-uint8_t uart_receive_char(void) {
-    return UDR1;
+static void info(const char *s) {
+    uart0_puts(s); uart0_puts("\r\n");
+    uart1_puts(s); uart1_puts("\r\n");
 }
 
-void uart_transmit_char(uint8_t data) {
-    while (!(UCSR1A & (1 << UDRE1)));
-    UDR1 = data;
+/* ================================================================
+   TWI (I2C) — 100 kHz
+   TWBR = (F_CPU/SCL - 16) / (2 x prescaler) = 72
+   TWSR = 0x00 (prescaler=1)
+   Sekwencja: START -> SLA+W -> dane -> STOP
+   ================================================================ */
+#define I2C_TIMEOUT 10000
+
+static void twi_init(void) {
+    TWSR = 0x00;
+    TWBR = 72;
+    TWCR = (1 << TWEN);
 }
 
-void uart_transmit_string(const char* str) {
-    uint16_t i = 0;
-    while (str[i] != '\0') {
-        uart_transmit_char((uint8_t)str[i]);
-        i++;
+static bool twi_start(void) {
+    uint16_t t = 0;
+    TWCR = (1 << TWINT) | (1 << TWSTA) | (1 << TWEN);
+    while (!(TWCR & (1 << TWINT))) if (++t > I2C_TIMEOUT) return false;
+    return true;
+}
+
+static void twi_stop(void) {
+    TWCR = (1 << TWINT) | (1 << TWEN) | (1 << TWSTO);
+}
+
+static bool twi_write_byte(uint8_t data) {
+    uint16_t t = 0;
+    TWDR = data;
+    TWCR = (1 << TWINT) | (1 << TWEN);
+    while (!(TWCR & (1 << TWINT))) if (++t > I2C_TIMEOUT) return false;
+    return true;
+}
+
+/* ================================================================
+   PCF8574T + HD44780 LCD (tryb 4-bit przez I2C)
+   Adres PCF8574T: 0x27 -> SLA+W = 0x4E
+   Mapowanie: P0=RS P1=RW P2=EN P3=BL P4-P7=D4-D7
+   HD44780: dane odbierane dwoma nibblami, zatrzask na zboczu
+   opadajacym EN (datasheet HD44780 str.45-46)
+   ================================================================ */
+#define LCD_ADDR_W  (0x27 << 1)
+#define LCD_RS      (1 << 0)
+#define LCD_EN      (1 << 2)
+#define LCD_BL      (1 << 3)
+
+static void pcf_write(uint8_t b) {
+    if (!twi_start()) return;
+    twi_write_byte(LCD_ADDR_W);
+    twi_write_byte(b);
+    twi_stop();
+}
+
+static void lcd_strobe(uint8_t b) {
+    pcf_write(b | LCD_EN);
+    _delay_us(1);
+    pcf_write(b & ~LCD_EN);
+    _delay_us(50);
+}
+
+static void lcd_send(uint8_t byte, uint8_t rs) {
+    uint8_t hi = (byte & 0xF0)        | LCD_BL | rs;
+    uint8_t lo = ((byte << 4) & 0xF0) | LCD_BL | rs;
+    lcd_strobe(hi);
+    lcd_strobe(lo);
+}
+
+#define lcd_cmd(c)  lcd_send((c), 0)
+#define lcd_chr(c)  lcd_send((c), LCD_RS)
+
+static void lcd_init(void) {
+    _delay_ms(50);
+    pcf_write(0x30 | LCD_BL); lcd_strobe(0x30 | LCD_BL); _delay_ms(5);
+    pcf_write(0x30 | LCD_BL); lcd_strobe(0x30 | LCD_BL); _delay_us(150);
+    pcf_write(0x30 | LCD_BL); lcd_strobe(0x30 | LCD_BL); _delay_us(150);
+    pcf_write(0x20 | LCD_BL); lcd_strobe(0x20 | LCD_BL); _delay_us(150);
+    lcd_cmd(0x28); _delay_us(50);  /* 4-bit, 2 linie, 5x8 */
+    lcd_cmd(0x08); _delay_us(50);  /* display OFF */
+    lcd_cmd(0x01); _delay_ms(2);   /* clear display */
+    lcd_cmd(0x06); _delay_us(50);  /* entry mode: kursor w prawo */
+    lcd_cmd(0x0C); _delay_us(50);  /* display ON, kursor OFF */
+}
+
+static void lcd_clear(void)  { lcd_cmd(0x01); _delay_ms(2); }
+
+static void lcd_goto(uint8_t col, uint8_t row) {
+    lcd_cmd(0x80 | ((row ? 0x40 : 0x00) + col));
+    _delay_us(50);
+}
+
+static void lcd_puts(const char *s) {
+    while (*s) { lcd_chr((uint8_t)*s++); _delay_us(50); }
+}
+
+static void lcd_putn(int32_t n) {
+    char buf[12]; int8_t i = 0;
+    if (n < 0) { lcd_chr('-'); n = -n; }
+    if (n == 0) { lcd_chr('0'); return; }
+    while (n > 0) { buf[i++] = '0' + (n % 10); n /= 10; }
+    while (i > 0) lcd_chr((uint8_t)buf[--i]);
+}
+
+static void lcd_puts_pad(const char *s) {
+    uint8_t len = (uint8_t)strlen(s);
+    if (len > 16) len = 16;
+    lcd_puts(s);
+    for (uint8_t i = len; i < 16; i++) lcd_chr(' ');
+}
+
+/* ================================================================
+   PCA9685 — ekspander PWM (LEDy kanaly 0-3)
+   Adres I2C: 0x40 -> SLA+W = 0x80
+   MODE1 (0x00): AI=1 (auto-increment), brak snu -> 0x21
+   LED0_ON_L (0x06): rejestr bazowy, +4 na kanal
+   Zapis 4 bajtow na kanal: ON_L ON_H OFF_L OFF_H
+   ================================================================ */
+#define PCA_ADDR_W  (0x40 << 1)
+#define PCA_MODE1   0x00
+#define PCA_LED0    0x06
+
+static void pca9685_init(void) {
+    if (!twi_start()) return;
+    twi_write_byte(PCA_ADDR_W);
+    twi_write_byte(PCA_MODE1);
+    twi_write_byte(0x21);  /* AI=1, wyjscie ze snu */
+    twi_stop();
+    _delay_ms(1);
+}
+
+static void pca_set(uint8_t ch, uint16_t on, uint16_t off) {
+    if (!twi_start()) return;
+    twi_write_byte(PCA_ADDR_W);
+    twi_write_byte(PCA_LED0 + 4 * ch);
+    twi_write_byte((uint8_t)(on  & 0xFF));
+    twi_write_byte((uint8_t)(on  >> 8));
+    twi_write_byte((uint8_t)(off & 0xFF));
+    twi_write_byte((uint8_t)(off >> 8));
+    twi_stop();
+}
+
+/* ================================================================
+   PWM silnikow
+   Timer3 Fast PWM 8-bit -> OC3A = ENA = Pin5 = PE3
+   Timer4 Fast PWM 8-bit -> OC4A = ENB = Pin6 = PH3
+                             OC4B = ENC = Pin7 = PH4
+                             OC4C = END = Pin8 = PH5
+   WGM = 0101 (Fast PWM 8-bit, TOP=0xFF)
+   COM = 10 (non-inverting)
+   Prescaler 8 -> f_PWM = 16MHz / (8x256) ~ 7.8kHz
+   ================================================================ */
+static void pwm_init(void) {
+    /* Timer3: OC3A (ENA, Pin5, PE3) */
+    TCCR3A = (1 << COM3A1) | (1 << WGM30);
+    TCCR3B = (1 << WGM32)  | (1 << CS31);
+    OCR3A  = 0;
+    DDRE  |= (1 << PE3);
+
+    /* Timer4: OC4A OC4B OC4C (ENB ENC END, Pins 6 7 8, PH3 PH4 PH5) */
+    TCCR4A = (1 << COM4A1) | (1 << COM4B1) | (1 << COM4C1) | (1 << WGM40);
+    TCCR4B = (1 << WGM42)  | (1 << CS41);
+    OCR4A  = 0; OCR4B = 0; OCR4C = 0;
+    DDRH  |= (1 << PH3) | (1 << PH4) | (1 << PH5);
+}
+
+/* ================================================================
+   GPIO
+   Silniki: PORTA (PA0-PA7) = Piny 22-29
+   Buzzer:  PL5 = Pin44
+   LED:     PL3 = Pin46
+   SR04:    TRIG=PD7=Pin38, ECHO=PG1=Pin40
+   ================================================================ */
+static void gpio_init(void) {
+    DDRA  = 0xFF; PORTA = 0x00;          /* silniki IN1-IN8 */
+    DDRL |= (1 << PL5) | (1 << PL3);    /* buzzer + LED */
+    PORTL &= ~((1 << PL5) | (1 << PL3));
+    DDRD  |= (1 << PD7); PORTD &= ~(1 << PD7);  /* TRIG */
+    DDRG  &= ~(1 << PG1);               /* ECHO jako wejscie */
+}
+
+/* ================================================================
+   BUZZER TONE — Timer5 CTC, toggle OC5C = PL5 = Pin44
+   WGM52=1 (CTC, TOP=OCR5A), COM5C0=1 (toggle)
+   Prescaler 8: OCR5A = F_CPU/(2x8xfreq) - 1
+   1000Hz -> OCR5A=999, 1500Hz -> OCR5A=666
+   ================================================================ */
+static void tone_start(uint16_t freq) {
+    uint32_t ocr = F_CPU / (2UL * 8UL * (uint32_t)freq) - 1;
+    if (ocr > 65535) ocr = 65535;
+    TCCR5A = (1 << COM5C0);
+    TCCR5B = (1 << WGM52) | (1 << CS51);
+    OCR5A  = (uint16_t)ocr;
+    DDRL  |= (1 << PL5);
+}
+
+static void tone_stop(void) {
+    TCCR5A = 0; TCCR5B = 0;
+    PORTL &= ~(1 << PL5);
+}
+
+/* ================================================================
+   HC-SR04 — pomiar przez Timer1
+   Timer1 normal mode, prescaler 8 -> 0.5 us/tick
+   Odleglosc [cm] = TCNT1 * 0.5 / 58 = TCNT1 / 116
+   ================================================================ */
+static long sr04_measure(void) {
+    PORTD |= (1 << PD7);
+    _delay_us(10);
+    PORTD &= ~(1 << PD7);
+
+    uint32_t t = millis();
+    while (!(PING & (1 << PG1))) {
+        if (millis() - t > 30) return 999;
+    }
+
+    TCCR1A = 0;
+    TCCR1B = (1 << CS11);  /* prescaler 8, 0.5us/tick */
+    TCNT1  = 0;
+
+    while (PING & (1 << PG1)) {
+        if (TCNT1 > 50000) { TCCR1B = 0; return 999; }
+    }
+
+    uint16_t ticks = TCNT1;
+    TCCR1B = 0;
+    return (long)ticks / 116;
+}
+
+/* ================================================================
+   SILNIKI
+   PA0=IN1 PA1=IN2 PA2=IN3 PA3=IN4 PA4=IN5 PA5=IN6 PA6=IN7 PA7=IN8
+   ================================================================ */
+static uint8_t predkosc = 200;
+
+static void silnikA(int8_t k) {
+    if      (k > 0) { PORTA |=  (1<<PA0); PORTA &= ~(1<<PA1); }
+    else if (k < 0) { PORTA &= ~(1<<PA0); PORTA |=  (1<<PA1); }
+    else            { PORTA &= ~((1<<PA0)|(1<<PA1)); }
+    OCR3A = (k != 0) ? predkosc : 0;
+}
+static void silnikB(int8_t k) {
+    if      (k > 0) { PORTA |=  (1<<PA2); PORTA &= ~(1<<PA3); }
+    else if (k < 0) { PORTA &= ~(1<<PA2); PORTA |=  (1<<PA3); }
+    else            { PORTA &= ~((1<<PA2)|(1<<PA3)); }
+    OCR4A = (k != 0) ? predkosc : 0;
+}
+static void silnikC(int8_t k) {
+    if      (k > 0) { PORTA |=  (1<<PA4); PORTA &= ~(1<<PA5); }
+    else if (k < 0) { PORTA &= ~(1<<PA4); PORTA |=  (1<<PA5); }
+    else            { PORTA &= ~((1<<PA4)|(1<<PA5)); }
+    OCR4B = (k != 0) ? predkosc : 0;
+}
+static void silnikD(int8_t k) {
+    if      (k > 0) { PORTA |=  (1<<PA6); PORTA &= ~(1<<PA7); }
+    else if (k < 0) { PORTA &= ~(1<<PA6); PORTA |=  (1<<PA7); }
+    else            { PORTA &= ~((1<<PA6)|(1<<PA7)); }
+    OCR4C = (k != 0) ? predkosc : 0;
+}
+static void stop_all(void) { silnikA(0); silnikB(0); silnikC(0); silnikD(0); }
+
+/* ================================================================
+   STAN GLOBALNY
+   ================================================================ */
+static bool     jedzie_przod   = false;
+static bool     za_blisko      = false;
+static bool     led_stan       = false;
+static bool     buzzer_aktywny = false;
+
+static uint32_t czas_pomiaru   = 0;
+static uint32_t czas_led       = 0;
+static uint32_t czas_pulse     = 0;
+static uint32_t czas_buzzer    = 0;
+
+static long     odleglosc_cm   = 999;
+static long     prev_odleglosc = -1;
+
+static char aktualny_kierunek[17] = "STOP";
+static char prev_kierunek[17]     = "";
+
+static int16_t pulse_val  = 0;
+static int16_t pulse_krok = 40;
+
+/* ================================================================
+   AKTUALIZACJA LCD (tylko przy zmianie)
+   ================================================================ */
+static void lcd_update(void) {
+    if (strcmp(aktualny_kierunek, prev_kierunek) != 0) {
+        lcd_goto(0, 0);
+        lcd_puts("Kier: ");
+        lcd_puts_pad(aktualny_kierunek);
+        strcpy(prev_kierunek, aktualny_kierunek);
+    }
+    if (odleglosc_cm != prev_odleglosc) {
+        lcd_goto(0, 1);
+        if (odleglosc_cm >= 999) {
+            lcd_puts("Odl: poza zasieg");
+        } else {
+            lcd_puts("Odl: ");
+            lcd_putn(odleglosc_cm);
+            lcd_puts(" cm         ");
+        }
+        prev_odleglosc = odleglosc_cm;
     }
 }
 
+/* ================================================================
+   OBSLUGA KOMENDY
+   ================================================================ */
+static void handle_cmd(char c) {
+    switch (c) {
+        case 'F': case 'f':
+            if (!za_blisko) {
+                silnikA(-1); silnikB(-1); silnikC(-1); silnikD(-1);
+                jedzie_przod = true;
+                strcpy(aktualny_kierunek, "PRZOD");
+                info("PRZOD");
+            } else { info("BLOKADA"); }
+            break;
+        case 'B': case 'b':
+            silnikA(1); silnikB(1); silnikC(1); silnikD(1);
+            jedzie_przod = false;
+            strcpy(aktualny_kierunek, "TYL");
+            info("TYL");
+            break;
+        case 'L': case 'l':
+            silnikA(1); silnikC(1); silnikB(-1); silnikD(-1);
+            jedzie_przod = false;
+            strcpy(aktualny_kierunek, "LEWO");
+            info("LEWO");
+            break;
+        case 'R': case 'r':
+            silnikA(-1); silnikC(-1); silnikB(1); silnikD(1);
+            jedzie_przod = false;
+            strcpy(aktualny_kierunek, "PRAWO");
+            info("PRAWO");
+            break;
+        case 'S': case 's':
+            stop_all();
+            jedzie_przod = false;
+            strcpy(aktualny_kierunek, "STOP");
+            info("STOP");
+            break;
+        case '+':
+            if (predkosc <= 235) predkosc += 20; else predkosc = 255;
+            uart0_puts("Predkosc: "); uart_putn(0, predkosc); uart0_puts("\r\n");
+            uart1_puts("Predkosc: "); uart_putn(1, predkosc); uart1_puts("\r\n");
+            break;
+        case '-':
+            if (predkosc >= 80) predkosc -= 20; else predkosc = 60;
+            uart0_puts("Predkosc: "); uart_putn(0, predkosc); uart0_puts("\r\n");
+            uart1_puts("Predkosc: "); uart_putn(1, predkosc); uart1_puts("\r\n");
+            break;
+    }
+}
 
-// =====================================================================
-//                       GŁÓWNY PROGRAM
-// =====================================================================
-
+/* ================================================================
+   MAIN
+   ================================================================ */
 int main(void) {
-    /* Inicjalizacja sprzętowa na poziomie rejestrów (dawne setup) */
-    init_uart_bluetooth(MY_UBRR);
-    twi_init();       // Inicjalizacja I2C (TWI)
-    pca9685_init();   // Inicjalizacja modułu LED
+    timer0_init();
+    sei();
 
-    uint8_t command_received = 0;
+    uart0_init();
+    uart1_init();
+    twi_init();
+    pwm_init();
+    gpio_init();
 
-    /* Pętla nieskończona programu */
+    lcd_init();
+    pca9685_init();
+    for (uint8_t i = 0; i < 4; i++) pca_set(i, 0, 0);
+
+    /* Ekran powitalny */
+    lcd_goto(0, 0); lcd_puts("  SAMOCHODZIK   ");
+    lcd_goto(0, 1); lcd_puts("   GOTOWY :)    ");
+    _delay_ms(1500);
+    lcd_clear();
+
+    stop_all();
+    lcd_update();
+    info("=== GOTOWY ===");
+    info("F/B/L/R/S/+/-");
+
     while (1) {
-        
-        /* Metoda odpytywania (Polling) */
-        if (uart_data_available()) {
-            
-            command_received = uart_receive_char();
+        uint32_t teraz = millis();
 
-            /* Analiza komendy i sterowanie modułem PCA9685 (Kanał 0) */
-            if (command_received == '1') {
-                /* Włącz diodę na maxa: ON na takcie 0, OFF na takcie 4095 */
-                pca9685_set_pwm(0, 0, 4095); 
-                uart_transmit_string("Dioda PCA9685: WLACZONA\r\n");
-            } 
-            else if (command_received == '0') {
-                /* Wyłącz diodę: ON na takcie 0, OFF na takcie 0 */
-                pca9685_set_pwm(0, 0, 0); 
-                uart_transmit_string("Dioda PCA9685: WYLACZONA\r\n");
+        /* Pomiar odleglosci co 150ms */
+        if (teraz - czas_pomiaru >= 150) {
+            czas_pomiaru = teraz;
+            odleglosc_cm = sr04_measure();
+            za_blisko    = (odleglosc_cm < 20);
+
+            if (jedzie_przod && za_blisko) {
+                stop_all();
+                jedzie_przod = false;
+                strcpy(aktualny_kierunek, "AUTO-STOP");
+                tone_start(1000);
+                buzzer_aktywny = true;
+                czas_buzzer    = teraz;
+                info("AUTO-STOP!");
             }
-            else {
-                uart_transmit_string("Nierozpoznana komenda!\r\n");
+            lcd_update();
+        }
+
+        /* Wylacz buzzer po 300ms */
+        if (buzzer_aktywny && (teraz - czas_buzzer >= 300)) {
+            tone_stop();
+            buzzer_aktywny = false;
+        }
+
+        /* Mruganie LED + buzzer co 200ms gdy za blisko */
+        if (teraz - czas_led >= 200) {
+            czas_led = teraz;
+            if (za_blisko) {
+                led_stan = !led_stan;
+                if (led_stan) PORTL |=  (1 << PL3);
+                else          PORTL &= ~(1 << PL3);
+                if (led_stan && !buzzer_aktywny) {
+                    tone_start(1500);
+                    buzzer_aktywny = true;
+                    czas_buzzer    = teraz;
+                }
+            } else {
+                PORTL &= ~(1 << PL3);
+                led_stan = false;
             }
         }
-        
+
+        /* Pulsowanie LEDow PCA9685 co 20ms */
+        if (teraz - czas_pulse >= 20) {
+            czas_pulse = teraz;
+            pulse_val += pulse_krok;
+            if (pulse_val >= 4095) { pulse_val = 4095; pulse_krok = -40; }
+            if (pulse_val <= 0)    { pulse_val = 0;    pulse_krok =  40; }
+            for (uint8_t i = 0; i < 4; i++) pca_set(i, 0, (uint16_t)pulse_val);
+        }
+
+        /* Komendy */
+        if (uart0_available()) handle_cmd((char)uart0_read());
+        if (uart1_available()) handle_cmd((char)uart1_read());
     }
 
-    return 0; 
+    return 0;
 }
