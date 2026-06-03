@@ -589,13 +589,13 @@ static void handle_cmd(char c) {
             info("TYL");
             break;
         case 'L': case 'l':
-            silnikA(-1); silnikC(-1); silnikB(1); silnikD(1);
+            silnikA(1); silnikC(-1); silnikB(-1); silnikD(1);
             jedzie_przod = false;
             strcpy(aktualny_kierunek, "LEWO");
             info("LEWO");
             break;
         case 'R': case 'r':
-            silnikA(1); silnikC(1); silnikB(-1); silnikD(-1);
+            silnikA(-1); silnikC(1); silnikB(1); silnikD(-1);
             jedzie_przod = false;
             strcpy(aktualny_kierunek, "PRAWO");
             info("PRAWO");
@@ -675,7 +675,6 @@ int main(void) {
         if ((teraz - czas_pomiaru) >= 150UL) {
             czas_pomiaru = teraz;
             odleglosc_cm = sr04_measure();
-            za_blisko    = (odleglosc_cm < 20L);
             lcd_update();
         }
 
