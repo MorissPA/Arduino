@@ -288,7 +288,7 @@ static void pwm_init(void) {
    ================================================================ */
 static void gpio_init(void) {
     DDRA  = 0xFFu; PORTA = 0x00u;
-    DDRB |= (1 << PB5); PORTB &= ~((1 << PB5);
+    DDRB |= (1 << PB5); PORTB &= ~(1 << PB5);
     DDRD  |= (1 << PD7); PORTD &= ~(1 << PD7);
     DDRL  &= ~(1 << PL1); PORTD &= ~(1 << PL1);
 }
@@ -420,6 +420,7 @@ static bool     kierunk_prawy_wlaczony = false;
 static bool     awaryjne_wlaczone     = false;
 static bool     mig_stan              = false;
 static uint32_t czas_ostatniego_mig   = 0;
+static uint32_t czas_ostatniego_i2c_mig = 0;
 
 static void ustaw_kanal(uint8_t kanal, bool wlaczony) {
     if (wlaczony) {
@@ -509,26 +510,41 @@ static void awaryjne_wylacz(void) {
     info("AWARYJNE: WYLACZONE");
 }
 
+static const uint16_t sin_tab[16] = {
+    0, 266, 1024, 2048, 3072, 3830, 4095, 3830,
+    3072, 2048, 1024, 266, 0, 0, 0, 0
+};
+
+#define OKRES_PULSOWANIA_MS  1000u
+
+static uint16_t oblicz_jasnosc_pulsu(void) {
+    uint32_t t = millis() % OKRES_PULSOWANIA_MS;
+    if (t < OKRES_PULSOWANIA_MS / 2) {
+        return (uint16_t)((uint32_t)t * 4095u / (OKRES_PULSOWANIA_MS / 2));
+    } else {
+        return (uint16_t)((uint32_t)(OKRES_PULSOWANIA_MS - t) * 4095u / (OKRES_PULSOWANIA_MS / 2));
+    }
+}
+
 static void obsluz_miganie(void) {
     if (!kierunk_lewy_wlaczony && !kierunk_prawy_wlaczony && !awaryjne_wlaczone) {
         return;
     }
+
     uint32_t teraz = millis();
-    if ((teraz - czas_ostatniego_mig) < CZAS_MIG_MS) {
+    if ((teraz - czas_ostatniego_i2c_mig) < 20u) {
         return;
     }
-    czas_ostatniego_mig = teraz;
-    mig_stan = !mig_stan;
+    czas_ostatniego_i2c_mig = teraz;
+
+    uint16_t jasnosc = oblicz_jasnosc_pulsu();  /* lub _sinus */
+
     if (awaryjne_wlaczone) {
-        ustaw_kanal(KANAL_KIERUNK_LEWY,  mig_stan);
-        ustaw_kanal(KANAL_KIERUNK_PRAWY, mig_stan);
+        pca_set(KANAL_KIERUNK_LEWY,  0u, jasnosc);
+        pca_set(KANAL_KIERUNK_PRAWY, 0u, jasnosc);
     } else {
-        if (kierunk_lewy_wlaczony) {
-            ustaw_kanal(KANAL_KIERUNK_LEWY, mig_stan);
-        }
-        if (kierunk_prawy_wlaczony) {
-            ustaw_kanal(KANAL_KIERUNK_PRAWY, mig_stan);
-        }
+        if (kierunk_lewy_wlaczony)  pca_set(KANAL_KIERUNK_LEWY,  0u, jasnosc);
+        if (kierunk_prawy_wlaczony) pca_set(KANAL_KIERUNK_PRAWY, 0u, jasnosc);
     }
 }
 
@@ -546,6 +562,7 @@ static long     prev_odleglosc = -1L;
 
 static char aktualny_kierunek[17] = "STOP";
 static char prev_kierunek[17]     = "";
+static char ostatni_ruch          = 'S';
 
 /* ================================================================
    AKTUALIZACJA LCD (tylko przy zmianie)
@@ -579,30 +596,35 @@ static void handle_cmd(char c) {
         case 'F': case 'f':
             silnikA(-1); silnikB(-1); silnikC(-1); silnikD(-1);
             jedzie_przod = true;
+            ostatni_ruch = 'F';         /* <-- NOWE */
             strcpy(aktualny_kierunek, "PRZOD");
             info("PRZOD");
             break;
         case 'B': case 'b':
             silnikA(1); silnikB(1); silnikC(1); silnikD(1);
             jedzie_przod = false;
+            ostatni_ruch = 'B';         /* <-- NOWE */
             strcpy(aktualny_kierunek, "TYL");
             info("TYL");
             break;
         case 'L': case 'l':
             silnikA(1); silnikC(-1); silnikB(-1); silnikD(1);
             jedzie_przod = false;
+            ostatni_ruch = 'L';         /* <-- NOWE */
             strcpy(aktualny_kierunek, "LEWO");
             info("LEWO");
             break;
         case 'R': case 'r':
             silnikA(-1); silnikC(1); silnikB(1); silnikD(-1);
             jedzie_przod = false;
+            ostatni_ruch = 'R';         /* <-- NOWE */
             strcpy(aktualny_kierunek, "PRAWO");
             info("PRAWO");
             break;
         case 'S': case 's':
             stop_all();
             jedzie_przod = false;
+            ostatni_ruch = 'S';         /* <-- NOWE */
             strcpy(aktualny_kierunek, "STOP");
             info("STOP");
             break;
@@ -610,11 +632,13 @@ static void handle_cmd(char c) {
             if (predkosc <= 235u) predkosc += 20u; else predkosc = 255u;
             uart0_puts("Predkosc: "); uart_putn(0, (int32_t)predkosc); uart0_puts("\r\n");
             uart1_puts("Predkosc: "); uart_putn(1, (int32_t)predkosc); uart1_puts("\r\n");
+            handle_cmd(ostatni_ruch);   /* <-- NOWE: zastosuj nową prędkość */
             break;
         case '-':
             if (predkosc >= 80u) predkosc -= 20u; else predkosc = 60u;
             uart0_puts("Predkosc: "); uart_putn(0, (int32_t)predkosc); uart0_puts("\r\n");
             uart1_puts("Predkosc: "); uart_putn(1, (int32_t)predkosc); uart1_puts("\r\n");
+            handle_cmd(ostatni_ruch);   /* <-- NOWE: zastosuj nową prędkość */
             break;
 
         /* --- SWIATLA --- */
