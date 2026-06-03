@@ -291,7 +291,7 @@ static void gpio_init(void) {
     DDRL |= (1 << PL5) | (1 << PL3);
     PORTL &= ~((1 << PL5) | (1 << PL3));
     DDRD  |= (1 << PD7); PORTD &= ~(1 << PD7);
-    DDRG  &= ~(1 << PG1);
+    DDRD  &= ~(1 << PD4); PORTD &= ~(1 << PD4);
 }
 
 /* ================================================================
@@ -318,28 +318,101 @@ static void tone_stop(void) {
    HC-SR04 — pomiar przez Timer1
    Timer1 normal mode, prescaler 8 -> 0.5 us/tick
    Odleglosc [cm] = TCNT1 * 0.5 / 58 = TCNT1 / 116
+   TRIG = PD7 (Pin 38)
+   ECHO = PD4 (Pin 43 -> ICP1)
    ================================================================ */
+static volatile uint16_t czas_start = 0;
+static volatile long     ostatnia_odleglosc = 999;
+static volatile bool     w_trakcie_pomiaru = false;
+
+/**
+ * @brief   Przerwanie Input Capture dla Timera 1 (pin ICP1 / PD4).
+ * Zapisuje czas zbocza narastającego, a następnie przestawia 
+ * sprzęt na nasłuch zbocza opadającego w celu wyliczenia dystansu.
+ * @param   brak
+ * @returns brak
+ * @side effects: Modyfikuje rejestry konfiguracyjne Timera 1 oraz 
+ * zmienne odpowiedzialne za stan pomiaru HC-SR04.
+ */
+ISR(TIMER1_CAPT_vect) {
+    // Odczyt zawartości 16-bitowego rejestru sprzętowego przechwytywania
+    uint16_t czas_obecny = ICR1; 
+    
+    // Sprawdzamy, czy sprzęt wyzwolił przerwanie na zboczu narastającym (czoło echa)
+    if (TCCR1B & (1 << ICES1)) {
+        czas_start = czas_obecny;
+        
+        // Zmień polaryzację zbocza wyzwalającego na opadające (koniec echa)
+        TCCR1B &= ~(1 << ICES1);
+        
+        // Zabezpieczenie sprzętowe: wyczyszczenie ewentualnej fałszywej flagi 
+        // przerwania, która mogła powstać przy samej zmianie polaryzacji zbocza
+        TIFR1 = (1 << ICF1);
+    } 
+    // Przerwanie wyzwolone na zboczu opadającym (koniec echa)
+    else {
+        // Różnica czasów zadziała poprawnie w matematyce uint16_t nawet 
+        // przy pojedynczym przepełnieniu sprzętowego licznika w locie
+        uint16_t czas_trwania = czas_obecny - czas_start; 
+        
+        // Zegar 16MHz, preskaler 8 -> 1 tik to 0.5 us.
+        // Odległość [cm] = czas [us] / 58 = (tiki * 0.5) / 58 = tiki / 116
+        ostatnia_odleglosc = (long)czas_trwania / 116;
+        
+        // Zabezpieczenie przed nierealnymi wynikami z czujnika
+        if (ostatnia_odleglosc > 400) {
+            ostatnia_odleglosc = 999;
+        }
+        
+        // Wyłączenie timera i przerwań modułu ICU do czasu następnego cyklu z main()
+        TCCR1B = 0;
+        TIMSK1 &= ~(1 << ICIE1);
+        w_trakcie_pomiaru = false;
+    }
+}
+
+/**
+ * @brief   Wyzwala nowy impuls ultradźwiękowy (TRIG) i asynchronicznie 
+ * konfiguruje Timer1 do nasłuchiwania fali powrotnej (ECHO).
+ * @param   brak
+ * @returns Ostatnio zmierzona odległość w centymetrach.
+ * @side effects: Generuje impuls na PD7, włącza Timer1 (TCCR1B, TIMSK1).
+ */
 static long sr04_measure(void) {
+    // Obsługa timeout'u: jeśli poprzedni pomiar jeszcze trwa (np. fala odbiła się 
+    // w przestrzeń i brak zbocza opadającego), wymuszamy reset maszyny stanów.
+    if (w_trakcie_pomiaru) {
+        TCCR1B = 0;
+        TIMSK1 &= ~(1 << ICIE1);
+        w_trakcie_pomiaru = false;
+        ostatnia_odleglosc = 999; 
+    }
+    
+    w_trakcie_pomiaru = true;
+    
+    // 1. Generowanie 10us impulsu wyzwalającego (TRIG)
     PORTD |= (1 << PD7);
     _delay_us(10);
     PORTD &= ~(1 << PD7);
-
-    uint32_t t = millis();
-    while (!(PING & (1 << PG1))) {
-        if ((millis() - t) > 30UL) return 999L;
-    }
-
-    TCCR1A = 0;
-    TCCR1B = (1 << CS11);
-    TCNT1  = 0;
-
-    while (PING & (1 << PG1)) {
-        if (TCNT1 > 50000u) { TCCR1B = 0; return 999L; }
-    }
-
-    uint16_t ticks = TCNT1;
-    TCCR1B = 0;
-    return (long)ticks / 116;
+    
+    // 2. Zerowanie głównego sprzętowego licznika Timera 1
+    TCNT1 = 0;
+    
+    // 3. Czyszczenie starych flag przerwań z poprzednich pomiarów
+    TIFR1 = (1 << ICF1);
+    
+    // 4. Włączenie przerwania "Input Capture Interrupt Enable 1"
+    TIMSK1 |= (1 << ICIE1);
+    
+    // 5. Start Timera 1. 
+    // ICNC1=1 (aktywacja sprzętowej filtracji szumów wejściowych)
+    // ICES1=1 (nasłuchiwanie pierwszego zbocza: narastającego)
+    // CS11=1  (włączenie preskalera dzielącego zegar przez 8)
+    TCCR1B = (1 << ICNC1) | (1 << ICES1) | (1 << CS11);
+    
+    // Funkcja kończy działanie natychmiast i nie blokuje programu. 
+    // Bieżący pomiar obliczy się w przerwaniu, my zwracamy wynik z zeszłego cyklu.
+    return ostatnia_odleglosc;
 }
 
 /* ================================================================
@@ -511,13 +584,10 @@ static void obsluz_miganie(void) {
    STAN GLOBALNY — jazda + czujnik
    ================================================================ */
 static bool     jedzie_przod   = false;
-static bool     za_blisko      = false;
-static bool     led_stan       = false;
-static bool     buzzer_aktywny = false;
+static bool     pikniecie_trwa = false;
 
 static uint32_t czas_pomiaru   = 0;
-static uint32_t czas_led       = 0;
-static uint32_t czas_buzzer    = 0;
+static uint32_t czas_ostatniego_pikniecia = 0;
 
 static long     odleglosc_cm   = 999L;
 static long     prev_odleglosc = -1L;
@@ -555,12 +625,10 @@ static void handle_cmd(char c) {
     switch (c) {
         /* --- JAZDA --- */
         case 'F': case 'f':
-            if (!za_blisko) {
-                silnikA(-1); silnikB(-1); silnikC(-1); silnikD(-1);
-                jedzie_przod = true;
-                strcpy(aktualny_kierunek, "PRZOD");
-                info("PRZOD");
-            } else { info("BLOKADA"); }
+            silnikA(-1); silnikB(-1); silnikC(-1); silnikD(-1);
+            jedzie_przod = true;
+            strcpy(aktualny_kierunek, "PRZOD");
+            info("PRZOD");
             break;
         case 'B': case 'b':
             silnikA(1); silnikB(1); silnikC(1); silnikD(1);
@@ -656,40 +724,45 @@ int main(void) {
             czas_pomiaru = teraz;
             odleglosc_cm = sr04_measure();
             za_blisko    = (odleglosc_cm < 20L);
-
-            if (jedzie_przod && za_blisko) {
-                stop_all();
-                jedzie_przod = false;
-                strcpy(aktualny_kierunek, "AUTO-STOP");
-                tone_start(1000u);
-                buzzer_aktywny = true;
-                czas_buzzer    = teraz;
-                info("AUTO-STOP!");
-            }
             lcd_update();
         }
 
-        /* wylacz buzzer po 300ms */
-        if (buzzer_aktywny && ((teraz - czas_buzzer) >= 300UL)) {
-            tone_stop();
-            buzzer_aktywny = false;
-        }
-
-        /* mruganie LED (pin 46) + buzzer co 200ms gdy za blisko */
-        if ((teraz - czas_led) >= 200UL) {
-            czas_led = teraz;
-            if (za_blisko) {
-                led_stan = !led_stan;
-                if (led_stan) { PORTL |=  (1u << PL3); }
-                else          { PORTL &= ~(1u << PL3); }
-                if (led_stan && !buzzer_aktywny) {
-                    tone_start(1500u);
-                    buzzer_aktywny = true;
-                    czas_buzzer    = teraz;
+          /* 2. Logika asystenta parkowania (PDC) */
+        if (odleglosc_cm > 100 || odleglosc_cm == 999) {
+            // Powyzej 1 metra - cisza
+            if (pikniecie_trwa) {
+                tone_stop();
+                pikniecie_trwa = false;
+            }
+        } 
+        else if (odleglosc_cm <= 15) {
+            // Ponizej 15 cm - ciagly pisk alarmowy
+            if (!pikniecie_trwa) {
+                tone_start(1000);
+                pikniecie_trwa = true;
+            }
+            // Zabezpieczenie, zeby nie pikal impulsowo w tym trybie
+            czas_ostatniego_pikniecia = teraz; 
+        } 
+        else {
+            // Dystans od 16 do 100 cm. 
+            // Mapowanie: dystans * 10 ms (np. 100cm = 1000ms, 20cm = 200ms)
+            uint16_t interwal = odleglosc_cm * 10;
+            
+            if (!pikniecie_trwa) {
+                // Czekamy w ciszy az minie wyliczony interwal
+                if (teraz - czas_ostatniego_pikniecia >= interwal) {
+                    czas_ostatniego_pikniecia = teraz;
+                    tone_start(1000);
+                    pikniecie_trwa = true;
                 }
             } else {
-                PORTL &= ~(1u << PL3);
-                led_stan = false;
+                // Trwa pikanie. Konczymy je po stalym czasie 80 ms
+                if (teraz - czas_ostatniego_pikniecia >= 80) {
+                    tone_stop();
+                    pikniecie_trwa = false;
+                    // Nastepne wlaczenie nastapi za (interwal - 80) ms
+                }
             }
         }
 
