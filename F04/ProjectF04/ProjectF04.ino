@@ -622,26 +622,12 @@ static void lcd_update(void) {
         lcd_puts_pad(aktualny_kierunek);
         strcpy(prev_kierunek, aktualny_kierunek);
     }
-<<<<<<< Updated upstream
     if (aktualne_rpm != prev_rpm) {
         lcd_goto(0, 1);
         lcd_puts("RPM: ");
         lcd_putn((int32_t)aktualne_rpm);
         lcd_puts("       "); // Puste spacje, aby nadpisać ewentualne stare, dłuższe liczby
         prev_rpm = aktualne_rpm;
-=======
-    if (odleglosc_cm != prev_odleglosc) {
-        lcd_goto(0u, 1u);
-        if (odleglosc_cm >= 999L) {
-            lcd_puts("Odl: poza zasieg");
-        } else {
-            lcd_puts("Odl: ");
-            lcd_putn(odleglosc_cm);
-            lcd_puts(" cm         ");
-        }
-        prev_odleglosc = odleglosc_cm;
->>>>>>> Stashed changes
-    }
 }
 
 /* ================================================================
@@ -793,7 +779,6 @@ int main(void) {
             }
         }
 
-<<<<<<< Updated upstream
         /* 5. Obliczanie RPM z czujnika Halla (co 1000 ms) */
         if (teraz - czas_rpm >= 1000) {
             czas_rpm = teraz;
@@ -818,9 +803,7 @@ int main(void) {
         }
 
         /* miganie kierunkowskazow i awaryjnych */
-=======
-        /* miganie / pulsowanie kierunkowskazow */
->>>>>>> Stashed changes
+
         obsluz_miganie();
 
         /* komendy Bluetooth / USB */
