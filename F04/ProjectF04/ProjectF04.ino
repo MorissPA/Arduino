@@ -9,7 +9,11 @@
  *   L298N #2: ENC=Pin7(PH4/OC4B) IN5=26(PA4) IN6=27(PA5)
  *             END=Pin8(PH5/OC4C) IN7=28(PA6) IN8=29(PA7)
  *   LCD I2C:  SDA=Pin20 SCL=Pin21, PCF8574T addr=0x27
- *   PCA9685:  ten sam I2C, addr=0x40, kanalY 0-3
+ *   PCA9685:  ten sam I2C, addr=0x40
+ *             kanal 0 = DRL lewy (bialy)
+ *             kanal 1 = DRL prawy (bialy)
+ *             kanal 2 = kierunkowskaz lewy (zolty)
+ *             kanal 3 = kierunkowskaz prawy (zolty)
  *   HC-SR04:  TRIG=Pin38(PD7) ECHO=Pin40(PG1)
  *   Buzzer:   Pin44(PL5/OC5C)
  *   LED:      Pin46(PL3)
@@ -20,6 +24,14 @@
  *   Timer3: Fast PWM 8-bit -> ENA (Pin5)
  *   Timer4: Fast PWM 8-bit -> ENB(6) ENC(7) END(8)
  *   Timer5: CTC toggle -> ton buzzera (Pin44)
+ *
+ * Komendy Bluetooth:
+ *   F/B/L/R/S = jazda przod/tyl/lewo/prawo/stop
+ *   +/-       = szybciej/wolniej
+ *   D         = DRL wlacz/wylacz
+ *   Q         = lewy kierunkowskaz wlacz/wylacz
+ *   E         = prawy kierunkowskaz wlacz/wylacz
+ *   H         = awaryjne wlacz/wylacz
  */
 
 #include <avr/io.h>
@@ -33,7 +45,7 @@
 
 /* ================================================================
    MILLIS — Timer0 CTC
-   Prescaler 64, OCR0A=249 -> 250 ticków x 4us = 1ms
+   Prescaler 64, OCR0A=249 -> 250 tickow x 4us = 1ms
    TCCR0A: WGM01=1 (CTC)
    TCCR0B: CS01|CS00 (prescaler 64)
    ================================================================ */
@@ -74,7 +86,7 @@ static void uart0_init(void) {
     UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
 }
 
-static bool    uart0_available(void) { return (UCSR0A & (1 << RXC0)); }
+static bool    uart0_available(void) { return (bool)(UCSR0A & (1 << RXC0)); }
 static uint8_t uart0_read(void)      { return UDR0; }
 static void    uart0_putc(char c)    { while (!(UCSR0A & (1 << UDRE0))); UDR0 = c; }
 static void    uart0_puts(const char *s) { while (*s) uart0_putc(*s++); }
@@ -86,17 +98,17 @@ static void uart1_init(void) {
     UCSR1C = (1 << UCSZ11) | (1 << UCSZ10);
 }
 
-static bool    uart1_available(void) { return (UCSR1A & (1 << RXC1)); }
+static bool    uart1_available(void) { return (bool)(UCSR1A & (1 << RXC1)); }
 static uint8_t uart1_read(void)      { return UDR1; }
 static void    uart1_putc(char c)    { while (!(UCSR1A & (1 << UDRE1))); UDR1 = c; }
 static void    uart1_puts(const char *s) { while (*s) uart1_putc(*s++); }
 
 static void uart_putn(uint8_t port, int32_t n) {
     char buf[12]; int8_t i = 0;
-    if (n < 0) { (port==0 ? uart0_putc : uart1_putc)('-'); n = -n; }
-    if (n == 0) { (port==0 ? uart0_putc : uart1_putc)('0'); return; }
+    if (n < 0) { (port==0u ? uart0_putc : uart1_putc)('-'); n = -n; }
+    if (n == 0) { (port==0u ? uart0_putc : uart1_putc)('0'); return; }
     while (n > 0) { buf[i++] = '0' + (n % 10); n /= 10; }
-    while (i > 0) { i--; (port==0 ? uart0_putc : uart1_putc)(buf[i]); }
+    while (i > 0) { i--; (port==0u ? uart0_putc : uart1_putc)(buf[i]); }
 }
 
 static void info(const char *s) {
@@ -110,7 +122,7 @@ static void info(const char *s) {
    TWSR = 0x00 (prescaler=1)
    Sekwencja: START -> SLA+W -> dane -> STOP
    ================================================================ */
-#define I2C_TIMEOUT 10000
+#define I2C_TIMEOUT 10000u
 
 static void twi_init(void) {
     TWSR = 0x00;
@@ -121,7 +133,7 @@ static void twi_init(void) {
 static bool twi_start(void) {
     uint16_t t = 0;
     TWCR = (1 << TWINT) | (1 << TWSTA) | (1 << TWEN);
-    while (!(TWCR & (1 << TWINT))) if (++t > I2C_TIMEOUT) return false;
+    while (!(TWCR & (1 << TWINT))) { if (++t > I2C_TIMEOUT) return false; }
     return true;
 }
 
@@ -133,7 +145,7 @@ static bool twi_write_byte(uint8_t data) {
     uint16_t t = 0;
     TWDR = data;
     TWCR = (1 << TWINT) | (1 << TWEN);
-    while (!(TWCR & (1 << TWINT))) if (++t > I2C_TIMEOUT) return false;
+    while (!(TWCR & (1 << TWINT))) { if (++t > I2C_TIMEOUT) return false; }
     return true;
 }
 
@@ -144,10 +156,10 @@ static bool twi_write_byte(uint8_t data) {
    HD44780: dane odbierane dwoma nibblami, zatrzask na zboczu
    opadajacym EN (datasheet HD44780 str.45-46)
    ================================================================ */
-#define LCD_ADDR_W  (0x27 << 1)
-#define LCD_RS      (1 << 0)
-#define LCD_EN      (1 << 2)
-#define LCD_BL      (1 << 3)
+#define LCD_ADDR_W  (0x27u << 1)
+#define LCD_RS      (1u << 0)
+#define LCD_EN      (1u << 2)
+#define LCD_BL      (1u << 3)
 
 static void pcf_write(uint8_t b) {
     if (!twi_start()) return;
@@ -164,32 +176,32 @@ static void lcd_strobe(uint8_t b) {
 }
 
 static void lcd_send(uint8_t byte, uint8_t rs) {
-    uint8_t hi = (byte & 0xF0)        | LCD_BL | rs;
-    uint8_t lo = ((byte << 4) & 0xF0) | LCD_BL | rs;
+    uint8_t hi = (byte & 0xF0u)         | LCD_BL | rs;
+    uint8_t lo = ((byte << 4u) & 0xF0u) | LCD_BL | rs;
     lcd_strobe(hi);
     lcd_strobe(lo);
 }
 
-#define lcd_cmd(c)  lcd_send((c), 0)
+#define lcd_cmd(c)  lcd_send((c), 0u)
 #define lcd_chr(c)  lcd_send((c), LCD_RS)
 
 static void lcd_init(void) {
     _delay_ms(50);
-    pcf_write(0x30 | LCD_BL); lcd_strobe(0x30 | LCD_BL); _delay_ms(5);
-    pcf_write(0x30 | LCD_BL); lcd_strobe(0x30 | LCD_BL); _delay_us(150);
-    pcf_write(0x30 | LCD_BL); lcd_strobe(0x30 | LCD_BL); _delay_us(150);
-    pcf_write(0x20 | LCD_BL); lcd_strobe(0x20 | LCD_BL); _delay_us(150);
-    lcd_cmd(0x28); _delay_us(50);  /* 4-bit, 2 linie, 5x8 */
-    lcd_cmd(0x08); _delay_us(50);  /* display OFF */
-    lcd_cmd(0x01); _delay_ms(2);   /* clear display */
-    lcd_cmd(0x06); _delay_us(50);  /* entry mode: kursor w prawo */
-    lcd_cmd(0x0C); _delay_us(50);  /* display ON, kursor OFF */
+    pcf_write(0x30u | LCD_BL); lcd_strobe(0x30u | LCD_BL); _delay_ms(5);
+    pcf_write(0x30u | LCD_BL); lcd_strobe(0x30u | LCD_BL); _delay_us(150);
+    pcf_write(0x30u | LCD_BL); lcd_strobe(0x30u | LCD_BL); _delay_us(150);
+    pcf_write(0x20u | LCD_BL); lcd_strobe(0x20u | LCD_BL); _delay_us(150);
+    lcd_cmd(0x28u); _delay_us(50);  /* 4-bit, 2 linie, 5x8 */
+    lcd_cmd(0x08u); _delay_us(50);  /* display OFF */
+    lcd_cmd(0x01u); _delay_ms(2);   /* clear display */
+    lcd_cmd(0x06u); _delay_us(50);  /* entry mode: kursor w prawo */
+    lcd_cmd(0x0Cu); _delay_us(50);  /* display ON, kursor OFF */
 }
 
-static void lcd_clear(void)  { lcd_cmd(0x01); _delay_ms(2); }
+static void lcd_clear(void) { lcd_cmd(0x01u); _delay_ms(2); }
 
 static void lcd_goto(uint8_t col, uint8_t row) {
-    lcd_cmd(0x80 | ((row ? 0x40 : 0x00) + col));
+    lcd_cmd(0x80u | ((row ? 0x40u : 0x00u) + col));
     _delay_us(50);
 }
 
@@ -202,14 +214,14 @@ static void lcd_putn(int32_t n) {
     if (n < 0) { lcd_chr('-'); n = -n; }
     if (n == 0) { lcd_chr('0'); return; }
     while (n > 0) { buf[i++] = '0' + (n % 10); n /= 10; }
-    while (i > 0) lcd_chr((uint8_t)buf[--i]);
+    while (i > 0) { lcd_chr((uint8_t)buf[--i]); }
 }
 
 static void lcd_puts_pad(const char *s) {
     uint8_t len = (uint8_t)strlen(s);
-    if (len > 16) len = 16;
+    if (len > 16u) len = 16u;
     lcd_puts(s);
-    for (uint8_t i = len; i < 16; i++) lcd_chr(' ');
+    for (uint8_t i = len; i < 16u; i++) { lcd_chr(' '); }
 }
 
 /* ================================================================
@@ -219,15 +231,15 @@ static void lcd_puts_pad(const char *s) {
    LED0_ON_L (0x06): rejestr bazowy, +4 na kanal
    Zapis 4 bajtow na kanal: ON_L ON_H OFF_L OFF_H
    ================================================================ */
-#define PCA_ADDR_W  (0x40 << 1)
-#define PCA_MODE1   0x00
-#define PCA_LED0    0x06
+#define PCA_ADDR_W  (0x40u << 1)
+#define PCA_MODE1   0x00u
+#define PCA_LED0    0x06u
 
 static void pca9685_init(void) {
     if (!twi_start()) return;
     twi_write_byte(PCA_ADDR_W);
     twi_write_byte(PCA_MODE1);
-    twi_write_byte(0x21);  /* AI=1, wyjscie ze snu */
+    twi_write_byte(0x21u);  /* AI=1, wyjscie ze snu */
     twi_stop();
     _delay_ms(1);
 }
@@ -235,11 +247,11 @@ static void pca9685_init(void) {
 static void pca_set(uint8_t ch, uint16_t on, uint16_t off) {
     if (!twi_start()) return;
     twi_write_byte(PCA_ADDR_W);
-    twi_write_byte(PCA_LED0 + 4 * ch);
-    twi_write_byte((uint8_t)(on  & 0xFF));
-    twi_write_byte((uint8_t)(on  >> 8));
-    twi_write_byte((uint8_t)(off & 0xFF));
-    twi_write_byte((uint8_t)(off >> 8));
+    twi_write_byte(PCA_LED0 + 4u * ch);
+    twi_write_byte((uint8_t)(on  & 0xFFu));
+    twi_write_byte((uint8_t)(on  >> 8u));
+    twi_write_byte((uint8_t)(off & 0xFFu));
+    twi_write_byte((uint8_t)(off >> 8u));
     twi_stop();
 }
 
@@ -275,11 +287,11 @@ static void pwm_init(void) {
    SR04:    TRIG=PD7=Pin38, ECHO=PG1=Pin40
    ================================================================ */
 static void gpio_init(void) {
-    DDRA  = 0xFF; PORTA = 0x00;          /* silniki IN1-IN8 */
-    DDRL |= (1 << PL5) | (1 << PL3);    /* buzzer + LED */
+    DDRA  = 0xFFu; PORTA = 0x00u;
+    DDRL |= (1 << PL5) | (1 << PL3);
     PORTL &= ~((1 << PL5) | (1 << PL3));
-    DDRD  |= (1 << PD7); PORTD &= ~(1 << PD7);  /* TRIG */
-    DDRG  &= ~(1 << PG1);               /* ECHO jako wejscie */
+    DDRD  |= (1 << PD7); PORTD &= ~(1 << PD7);
+    DDRG  &= ~(1 << PG1);
 }
 
 /* ================================================================
@@ -289,8 +301,8 @@ static void gpio_init(void) {
    1000Hz -> OCR5A=999, 1500Hz -> OCR5A=666
    ================================================================ */
 static void tone_start(uint16_t freq) {
-    uint32_t ocr = F_CPU / (2UL * 8UL * (uint32_t)freq) - 1;
-    if (ocr > 65535) ocr = 65535;
+    uint32_t ocr = F_CPU / (2UL * 8UL * (uint32_t)freq) - 1UL;
+    if (ocr > 65535UL) ocr = 65535UL;
     TCCR5A = (1 << COM5C0);
     TCCR5B = (1 << WGM52) | (1 << CS51);
     OCR5A  = (uint16_t)ocr;
@@ -314,15 +326,15 @@ static long sr04_measure(void) {
 
     uint32_t t = millis();
     while (!(PING & (1 << PG1))) {
-        if (millis() - t > 30) return 999;
+        if ((millis() - t) > 30UL) return 999L;
     }
 
     TCCR1A = 0;
-    TCCR1B = (1 << CS11);  /* prescaler 8, 0.5us/tick */
+    TCCR1B = (1 << CS11);
     TCNT1  = 0;
 
     while (PING & (1 << PG1)) {
-        if (TCNT1 > 50000) { TCCR1B = 0; return 999; }
+        if (TCNT1 > 50000u) { TCCR1B = 0; return 999L; }
     }
 
     uint16_t ticks = TCNT1;
@@ -334,36 +346,169 @@ static long sr04_measure(void) {
    SILNIKI
    PA0=IN1 PA1=IN2 PA2=IN3 PA3=IN4 PA4=IN5 PA5=IN6 PA6=IN7 PA7=IN8
    ================================================================ */
-static uint8_t predkosc = 200;
+static uint8_t predkosc = 200u;
 
 static void silnikA(int8_t k) {
-    if      (k > 0) { PORTA |=  (1<<PA0); PORTA &= ~(1<<PA1); }
-    else if (k < 0) { PORTA &= ~(1<<PA0); PORTA |=  (1<<PA1); }
-    else            { PORTA &= ~((1<<PA0)|(1<<PA1)); }
-    OCR3A = (k != 0) ? predkosc : 0;
+    if      (k > 0) { PORTA |=  (1u<<PA0); PORTA &= ~(1u<<PA1); }
+    else if (k < 0) { PORTA &= ~(1u<<PA0); PORTA |=  (1u<<PA1); }
+    else            { PORTA &= ~((1u<<PA0)|(1u<<PA1)); }
+    OCR3A = (k != 0) ? predkosc : 0u;
 }
 static void silnikB(int8_t k) {
-    if      (k > 0) { PORTA |=  (1<<PA2); PORTA &= ~(1<<PA3); }
-    else if (k < 0) { PORTA &= ~(1<<PA2); PORTA |=  (1<<PA3); }
-    else            { PORTA &= ~((1<<PA2)|(1<<PA3)); }
-    OCR4A = (k != 0) ? predkosc : 0;
+    if      (k > 0) { PORTA |=  (1u<<PA2); PORTA &= ~(1u<<PA3); }
+    else if (k < 0) { PORTA &= ~(1u<<PA2); PORTA |=  (1u<<PA3); }
+    else            { PORTA &= ~((1u<<PA2)|(1u<<PA3)); }
+    OCR4A = (k != 0) ? predkosc : 0u;
 }
 static void silnikC(int8_t k) {
-    if      (k > 0) { PORTA |=  (1<<PA4); PORTA &= ~(1<<PA5); }
-    else if (k < 0) { PORTA &= ~(1<<PA4); PORTA |=  (1<<PA5); }
-    else            { PORTA &= ~((1<<PA4)|(1<<PA5)); }
-    OCR4B = (k != 0) ? predkosc : 0;
+    if      (k > 0) { PORTA |=  (1u<<PA4); PORTA &= ~(1u<<PA5); }
+    else if (k < 0) { PORTA &= ~(1u<<PA4); PORTA |=  (1u<<PA5); }
+    else            { PORTA &= ~((1u<<PA4)|(1u<<PA5)); }
+    OCR4B = (k != 0) ? predkosc : 0u;
 }
 static void silnikD(int8_t k) {
-    if      (k > 0) { PORTA |=  (1<<PA6); PORTA &= ~(1<<PA7); }
-    else if (k < 0) { PORTA &= ~(1<<PA6); PORTA |=  (1<<PA7); }
-    else            { PORTA &= ~((1<<PA6)|(1<<PA7)); }
-    OCR4C = (k != 0) ? predkosc : 0;
+    if      (k > 0) { PORTA |=  (1u<<PA6); PORTA &= ~(1u<<PA7); }
+    else if (k < 0) { PORTA &= ~(1u<<PA6); PORTA |=  (1u<<PA7); }
+    else            { PORTA &= ~((1u<<PA6)|(1u<<PA7)); }
+    OCR4C = (k != 0) ? predkosc : 0u;
 }
 static void stop_all(void) { silnikA(0); silnikB(0); silnikC(0); silnikD(0); }
 
 /* ================================================================
-   STAN GLOBALNY
+   LEDY PCA9685
+   kanal 0 = DRL lewy (bialy)
+   kanal 1 = DRL prawy (bialy)
+   kanal 2 = kierunkowskaz lewy (zolty)
+   kanal 3 = kierunkowskaz prawy (zolty)
+   ================================================================ */
+#define KANAL_DRL_LEWY     0u
+#define KANAL_DRL_PRAWY    1u
+#define KANAL_KIERUNK_LEWY  2u
+#define KANAL_KIERUNK_PRAWY 3u
+#define JASNOSC_PELNA      4095u
+#define JASNOSC_ZERO       0u
+#define CZAS_MIG_MS        500u
+
+static bool     drl_wlaczone          = false;
+static bool     kierunk_lewy_wlaczony = false;
+static bool     kierunk_prawy_wlaczony = false;
+static bool     awaryjne_wlaczone     = false;
+static bool     mig_stan              = false;
+static uint32_t czas_ostatniego_mig   = 0;
+
+static void ustaw_kanal(uint8_t kanal, bool wlaczony) {
+    if (wlaczony) {
+        pca_set(kanal, 0u, JASNOSC_PELNA);
+    } else {
+        pca_set(kanal, 0u, JASNOSC_ZERO);
+    }
+}
+
+static void drl_wlacz(void) {
+    drl_wlaczone = true;
+    ustaw_kanal(KANAL_DRL_LEWY, true);
+    ustaw_kanal(KANAL_DRL_PRAWY, true);
+    info("DRL: WLACZONE");
+}
+
+static void drl_wylacz(void) {
+    drl_wlaczone = false;
+    ustaw_kanal(KANAL_DRL_LEWY, false);
+    ustaw_kanal(KANAL_DRL_PRAWY, false);
+    info("DRL: WYLACZONE");
+}
+
+static void kierunk_lewy_wlacz(void) {
+    if (kierunk_prawy_wlaczony) {
+        kierunk_prawy_wlaczony = false;
+        ustaw_kanal(KANAL_KIERUNK_PRAWY, false);
+    }
+    if (awaryjne_wlaczone) {
+        awaryjne_wlaczone = false;
+    }
+    kierunk_lewy_wlaczony = true;
+    mig_stan = true;
+    czas_ostatniego_mig = millis();
+    ustaw_kanal(KANAL_KIERUNK_LEWY, true);
+    info("KIERUNK: LEWY");
+}
+
+static void kierunk_lewy_wylacz(void) {
+    kierunk_lewy_wlaczony = false;
+    ustaw_kanal(KANAL_KIERUNK_LEWY, false);
+    info("KIERUNK: LEWY WYLACZONY");
+}
+
+static void kierunk_prawy_wlacz(void) {
+    if (kierunk_lewy_wlaczony) {
+        kierunk_lewy_wlaczony = false;
+        ustaw_kanal(KANAL_KIERUNK_LEWY, false);
+    }
+    if (awaryjne_wlaczone) {
+        awaryjne_wlaczone = false;
+    }
+    kierunk_prawy_wlaczony = true;
+    mig_stan = true;
+    czas_ostatniego_mig = millis();
+    ustaw_kanal(KANAL_KIERUNK_PRAWY, true);
+    info("KIERUNK: PRAWY");
+}
+
+static void kierunk_prawy_wylacz(void) {
+    kierunk_prawy_wlaczony = false;
+    ustaw_kanal(KANAL_KIERUNK_PRAWY, false);
+    info("KIERUNK: PRAWY WYLACZONY");
+}
+
+static void awaryjne_wlacz(void) {
+    if (kierunk_lewy_wlaczony) {
+        kierunk_lewy_wlaczony = false;
+        ustaw_kanal(KANAL_KIERUNK_LEWY, false);
+    }
+    if (kierunk_prawy_wlaczony) {
+        kierunk_prawy_wlaczony = false;
+        ustaw_kanal(KANAL_KIERUNK_PRAWY, false);
+    }
+    awaryjne_wlaczone = true;
+    mig_stan = true;
+    czas_ostatniego_mig = millis();
+    ustaw_kanal(KANAL_KIERUNK_LEWY, true);
+    ustaw_kanal(KANAL_KIERUNK_PRAWY, true);
+    info("AWARYJNE: WLACZONE");
+}
+
+static void awaryjne_wylacz(void) {
+    awaryjne_wlaczone = false;
+    ustaw_kanal(KANAL_KIERUNK_LEWY, false);
+    ustaw_kanal(KANAL_KIERUNK_PRAWY, false);
+    info("AWARYJNE: WYLACZONE");
+}
+
+static void obsluz_miganie(void) {
+    if (!kierunk_lewy_wlaczony && !kierunk_prawy_wlaczony && !awaryjne_wlaczone) {
+        return;
+    }
+    uint32_t teraz = millis();
+    if ((teraz - czas_ostatniego_mig) < CZAS_MIG_MS) {
+        return;
+    }
+    czas_ostatniego_mig = teraz;
+    mig_stan = !mig_stan;
+    if (awaryjne_wlaczone) {
+        ustaw_kanal(KANAL_KIERUNK_LEWY,  mig_stan);
+        ustaw_kanal(KANAL_KIERUNK_PRAWY, mig_stan);
+    } else {
+        if (kierunk_lewy_wlaczony) {
+            ustaw_kanal(KANAL_KIERUNK_LEWY, mig_stan);
+        }
+        if (kierunk_prawy_wlaczony) {
+            ustaw_kanal(KANAL_KIERUNK_PRAWY, mig_stan);
+        }
+    }
+}
+
+/* ================================================================
+   STAN GLOBALNY — jazda + czujnik
    ================================================================ */
 static bool     jedzie_przod   = false;
 static bool     za_blisko      = false;
@@ -372,17 +517,13 @@ static bool     buzzer_aktywny = false;
 
 static uint32_t czas_pomiaru   = 0;
 static uint32_t czas_led       = 0;
-static uint32_t czas_pulse     = 0;
 static uint32_t czas_buzzer    = 0;
 
-static long     odleglosc_cm   = 999;
-static long     prev_odleglosc = -1;
+static long     odleglosc_cm   = 999L;
+static long     prev_odleglosc = -1L;
 
 static char aktualny_kierunek[17] = "STOP";
 static char prev_kierunek[17]     = "";
-
-static int16_t pulse_val  = 0;
-static int16_t pulse_krok = 40;
 
 /* ================================================================
    AKTUALIZACJA LCD (tylko przy zmianie)
@@ -396,7 +537,7 @@ static void lcd_update(void) {
     }
     if (odleglosc_cm != prev_odleglosc) {
         lcd_goto(0, 1);
-        if (odleglosc_cm >= 999) {
+        if (odleglosc_cm >= 999L) {
             lcd_puts("Odl: poza zasieg");
         } else {
             lcd_puts("Odl: ");
@@ -412,6 +553,7 @@ static void lcd_update(void) {
    ================================================================ */
 static void handle_cmd(char c) {
     switch (c) {
+        /* --- JAZDA --- */
         case 'F': case 'f':
             if (!za_blisko) {
                 silnikA(-1); silnikB(-1); silnikC(-1); silnikD(-1);
@@ -427,13 +569,13 @@ static void handle_cmd(char c) {
             info("TYL");
             break;
         case 'L': case 'l':
-            silnikA(1); silnikC(1); silnikB(-1); silnikD(-1);
+            silnikA(-1); silnikC(-1); silnikB(1); silnikD(1);
             jedzie_przod = false;
             strcpy(aktualny_kierunek, "LEWO");
             info("LEWO");
             break;
         case 'R': case 'r':
-            silnikA(-1); silnikC(-1); silnikB(1); silnikD(1);
+            silnikA(1); silnikC(1); silnikB(-1); silnikD(-1);
             jedzie_przod = false;
             strcpy(aktualny_kierunek, "PRAWO");
             info("PRAWO");
@@ -445,14 +587,31 @@ static void handle_cmd(char c) {
             info("STOP");
             break;
         case '+':
-            if (predkosc <= 235) predkosc += 20; else predkosc = 255;
-            uart0_puts("Predkosc: "); uart_putn(0, predkosc); uart0_puts("\r\n");
-            uart1_puts("Predkosc: "); uart_putn(1, predkosc); uart1_puts("\r\n");
+            if (predkosc <= 235u) predkosc += 20u; else predkosc = 255u;
+            uart0_puts("Predkosc: "); uart_putn(0, (int32_t)predkosc); uart0_puts("\r\n");
+            uart1_puts("Predkosc: "); uart_putn(1, (int32_t)predkosc); uart1_puts("\r\n");
             break;
         case '-':
-            if (predkosc >= 80) predkosc -= 20; else predkosc = 60;
-            uart0_puts("Predkosc: "); uart_putn(0, predkosc); uart0_puts("\r\n");
-            uart1_puts("Predkosc: "); uart_putn(1, predkosc); uart1_puts("\r\n");
+            if (predkosc >= 80u) predkosc -= 20u; else predkosc = 60u;
+            uart0_puts("Predkosc: "); uart_putn(0, (int32_t)predkosc); uart0_puts("\r\n");
+            uart1_puts("Predkosc: "); uart_putn(1, (int32_t)predkosc); uart1_puts("\r\n");
+            break;
+
+        /* --- SWIATLA --- */
+        case 'D': case 'd':
+            if (drl_wlaczone) { drl_wylacz(); } else { drl_wlacz(); }
+            break;
+        case 'Q': case 'q':
+            if (kierunk_lewy_wlaczony) { kierunk_lewy_wylacz(); } else { kierunk_lewy_wlacz(); }
+            break;
+        case 'E': case 'e':
+            if (kierunk_prawy_wlaczony) { kierunk_prawy_wylacz(); } else { kierunk_prawy_wlacz(); }
+            break;
+        case 'H': case 'h':
+            if (awaryjne_wlaczone) { awaryjne_wylacz(); } else { awaryjne_wlacz(); }
+            break;
+
+        default:
             break;
     }
 }
@@ -472,9 +631,13 @@ int main(void) {
 
     lcd_init();
     pca9685_init();
-    for (uint8_t i = 0; i < 4; i++) pca_set(i, 0, 0);
 
-    /* Ekran powitalny */
+    /* wyzeruj wszystkie kanaly PCA9685 */
+    for (uint8_t i = 0u; i < 4u; i++) {
+        pca_set(i, 0u, 0u);
+    }
+
+    /* ekran powitalny */
     lcd_goto(0, 0); lcd_puts("  SAMOCHODZIK   ");
     lcd_goto(0, 1); lcd_puts("   GOTOWY :)    ");
     _delay_ms(1500);
@@ -483,22 +646,22 @@ int main(void) {
     stop_all();
     lcd_update();
     info("=== GOTOWY ===");
-    info("F/B/L/R/S/+/-");
+    info("F/B/L/R/S/+/-/D/Q/E/H");
 
     while (1) {
         uint32_t teraz = millis();
 
-        /* Pomiar odleglosci co 150ms */
-        if (teraz - czas_pomiaru >= 150) {
+        /* pomiar odleglosci co 150ms */
+        if ((teraz - czas_pomiaru) >= 150UL) {
             czas_pomiaru = teraz;
             odleglosc_cm = sr04_measure();
-            za_blisko    = (odleglosc_cm < 20);
+            za_blisko    = (odleglosc_cm < 20L);
 
             if (jedzie_przod && za_blisko) {
                 stop_all();
                 jedzie_przod = false;
                 strcpy(aktualny_kierunek, "AUTO-STOP");
-                tone_start(1000);
+                tone_start(1000u);
                 buzzer_aktywny = true;
                 czas_buzzer    = teraz;
                 info("AUTO-STOP!");
@@ -506,42 +669,36 @@ int main(void) {
             lcd_update();
         }
 
-        /* Wylacz buzzer po 300ms */
-        if (buzzer_aktywny && (teraz - czas_buzzer >= 300)) {
+        /* wylacz buzzer po 300ms */
+        if (buzzer_aktywny && ((teraz - czas_buzzer) >= 300UL)) {
             tone_stop();
             buzzer_aktywny = false;
         }
 
-        /* Mruganie LED + buzzer co 200ms gdy za blisko */
-        if (teraz - czas_led >= 200) {
+        /* mruganie LED (pin 46) + buzzer co 200ms gdy za blisko */
+        if ((teraz - czas_led) >= 200UL) {
             czas_led = teraz;
             if (za_blisko) {
                 led_stan = !led_stan;
-                if (led_stan) PORTL |=  (1 << PL3);
-                else          PORTL &= ~(1 << PL3);
+                if (led_stan) { PORTL |=  (1u << PL3); }
+                else          { PORTL &= ~(1u << PL3); }
                 if (led_stan && !buzzer_aktywny) {
-                    tone_start(1500);
+                    tone_start(1500u);
                     buzzer_aktywny = true;
                     czas_buzzer    = teraz;
                 }
             } else {
-                PORTL &= ~(1 << PL3);
+                PORTL &= ~(1u << PL3);
                 led_stan = false;
             }
         }
 
-        /* Pulsowanie LEDow PCA9685 co 20ms */
-        if (teraz - czas_pulse >= 20) {
-            czas_pulse = teraz;
-            pulse_val += pulse_krok;
-            if (pulse_val >= 4095) { pulse_val = 4095; pulse_krok = -40; }
-            if (pulse_val <= 0)    { pulse_val = 0;    pulse_krok =  40; }
-            for (uint8_t i = 0; i < 4; i++) pca_set(i, 0, (uint16_t)pulse_val);
-        }
+        /* miganie kierunkowskazow i awaryjnych */
+        obsluz_miganie();
 
-        /* Komendy */
-        if (uart0_available()) handle_cmd((char)uart0_read());
-        if (uart1_available()) handle_cmd((char)uart1_read());
+        /* komendy */
+        if (uart0_available()) { handle_cmd((char)uart0_read()); }
+        if (uart1_available()) { handle_cmd((char)uart1_read()); }
     }
 
     return 0;
