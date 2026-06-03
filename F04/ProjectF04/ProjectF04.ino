@@ -288,10 +288,9 @@ static void pwm_init(void) {
    ================================================================ */
 static void gpio_init(void) {
     DDRA  = 0xFFu; PORTA = 0x00u;
-    DDRL |= (1 << PL5) | (1 << PL3);
-    PORTL &= ~((1 << PL5) | (1 << PL3));
+    DDRB |= (1 << PB5); PORTB &= ~((1 << PB5);
     DDRD  |= (1 << PD7); PORTD &= ~(1 << PD7);
-    DDRD  &= ~(1 << PD4); PORTD &= ~(1 << PD4);
+    DDRL  &= ~(1 << PL1); PORTD &= ~(1 << PL1);
 }
 
 /* ================================================================
@@ -303,115 +302,68 @@ static void gpio_init(void) {
 static void tone_start(uint16_t freq) {
     uint32_t ocr = F_CPU / (2UL * 8UL * (uint32_t)freq) - 1UL;
     if (ocr > 65535UL) ocr = 65535UL;
-    TCCR5A = (1 << COM5C0);
-    TCCR5B = (1 << WGM52) | (1 << CS51);
+    TCCR1A = (1 << COM1A0);
+    TCCR1B = (1 << WGM12) | (1 << CS11);
     OCR5A  = (uint16_t)ocr;
-    DDRL  |= (1 << PL5);
+    DDRB  |= (1 << PB5);
 }
 
 static void tone_stop(void) {
-    TCCR5A = 0; TCCR5B = 0;
-    PORTL &= ~(1 << PL5);
+    TCCR1A = 0; TCCR1B = 0;
+    PORTB &= ~(1 << PB5);
 }
 
 /* ================================================================
-   HC-SR04 — pomiar przez Timer1
-   Timer1 normal mode, prescaler 8 -> 0.5 us/tick
-   Odleglosc [cm] = TCNT1 * 0.5 / 58 = TCNT1 / 116
+   HC-SR04 — asynchroniczny pomiar przez Timer5 (Input Capture)
    TRIG = PD7 (Pin 38)
-   ECHO = PD4 (Pin 43 -> ICP1)
+   ECHO = PL1 (Pin 48 -> ICP5)
    ================================================================ */
 static volatile uint16_t czas_start = 0;
 static volatile long     ostatnia_odleglosc = 999;
 static volatile bool     w_trakcie_pomiaru = false;
 
-/**
- * @brief   Przerwanie Input Capture dla Timera 1 (pin ICP1 / PD4).
- * Zapisuje czas zbocza narastającego, a następnie przestawia 
- * sprzęt na nasłuch zbocza opadającego w celu wyliczenia dystansu.
- * @param   brak
- * @returns brak
- * @side effects: Modyfikuje rejestry konfiguracyjne Timera 1 oraz 
- * zmienne odpowiedzialne za stan pomiaru HC-SR04.
- */
-ISR(TIMER1_CAPT_vect) {
-    // Odczyt zawartości 16-bitowego rejestru sprzętowego przechwytywania
-    uint16_t czas_obecny = ICR1; 
+ISR(TIMER5_CAPT_vect) {
+    uint16_t czas_obecny = ICR5; 
     
-    // Sprawdzamy, czy sprzęt wyzwolił przerwanie na zboczu narastającym (czoło echa)
-    if (TCCR1B & (1 << ICES1)) {
+    if (TCCR5B & (1 << ICES5)) {
         czas_start = czas_obecny;
-        
-        // Zmień polaryzację zbocza wyzwalającego na opadające (koniec echa)
-        TCCR1B &= ~(1 << ICES1);
-        
-        // Zabezpieczenie sprzętowe: wyczyszczenie ewentualnej fałszywej flagi 
-        // przerwania, która mogła powstać przy samej zmianie polaryzacji zbocza
-        TIFR1 = (1 << ICF1);
+        TCCR5B &= ~(1 << ICES5);
+        TIFR5 = (1 << ICF5);
     } 
-    // Przerwanie wyzwolone na zboczu opadającym (koniec echa)
     else {
-        // Różnica czasów zadziała poprawnie w matematyce uint16_t nawet 
-        // przy pojedynczym przepełnieniu sprzętowego licznika w locie
         uint16_t czas_trwania = czas_obecny - czas_start; 
-        
-        // Zegar 16MHz, preskaler 8 -> 1 tik to 0.5 us.
-        // Odległość [cm] = czas [us] / 58 = (tiki * 0.5) / 58 = tiki / 116
         ostatnia_odleglosc = (long)czas_trwania / 116;
         
-        // Zabezpieczenie przed nierealnymi wynikami z czujnika
         if (ostatnia_odleglosc > 400) {
             ostatnia_odleglosc = 999;
         }
         
-        // Wyłączenie timera i przerwań modułu ICU do czasu następnego cyklu z main()
-        TCCR1B = 0;
-        TIMSK1 &= ~(1 << ICIE1);
+        TCCR5B = 0;
+        TIMSK5 &= ~(1 << ICIE5);
         w_trakcie_pomiaru = false;
     }
 }
 
-/**
- * @brief   Wyzwala nowy impuls ultradźwiękowy (TRIG) i asynchronicznie 
- * konfiguruje Timer1 do nasłuchiwania fali powrotnej (ECHO).
- * @param   brak
- * @returns Ostatnio zmierzona odległość w centymetrach.
- * @side effects: Generuje impuls na PD7, włącza Timer1 (TCCR1B, TIMSK1).
- */
 static long sr04_measure(void) {
-    // Obsługa timeout'u: jeśli poprzedni pomiar jeszcze trwa (np. fala odbiła się 
-    // w przestrzeń i brak zbocza opadającego), wymuszamy reset maszyny stanów.
     if (w_trakcie_pomiaru) {
-        TCCR1B = 0;
-        TIMSK1 &= ~(1 << ICIE1);
+        TCCR5B = 0;
+        TIMSK5 &= ~(1 << ICIE5);
         w_trakcie_pomiaru = false;
         ostatnia_odleglosc = 999; 
     }
     
     w_trakcie_pomiaru = true;
     
-    // 1. Generowanie 10us impulsu wyzwalającego (TRIG)
     PORTD |= (1 << PD7);
     _delay_us(10);
     PORTD &= ~(1 << PD7);
     
-    // 2. Zerowanie głównego sprzętowego licznika Timera 1
-    TCNT1 = 0;
+    TCNT5 = 0;
+    TIFR5 = (1 << ICF5);
+    TIMSK5 |= (1 << ICIE5);
     
-    // 3. Czyszczenie starych flag przerwań z poprzednich pomiarów
-    TIFR1 = (1 << ICF1);
+    TCCR5B = (1 << ICNC5) | (1 << ICES5) | (1 << CS51);
     
-    // 4. Włączenie przerwania "Input Capture Interrupt Enable 1"
-    TIMSK1 |= (1 << ICIE1);
-    
-    // 5. Start Timera 1. 
-    // ICNC1=1 (aktywacja sprzętowej filtracji szumów wejściowych)
-    // ICES1=1 (nasłuchiwanie pierwszego zbocza: narastającego)
-    // CS11=1  (włączenie preskalera dzielącego zegar przez 8)
-    TCCR1B = (1 << ICNC1) | (1 << ICES1) | (1 << CS11);
-    
-    // Funkcja kończy działanie natychmiast i nie blokuje programu. 
-    // Bieżący pomiar obliczy się w przerwaniu, my zwracamy wynik z zeszłego cyklu.
     return ostatnia_odleglosc;
 }
 
