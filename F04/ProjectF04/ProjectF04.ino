@@ -362,6 +362,30 @@ static long sr04_measure(void) {
 }
 
 /* ================================================================
+   FOTOREZYSTOR (ADC) - Automatyczne DRL (Pin PF0 / A0)
+   ADC0, preskaler 128, AVCC jako referencja, przerwanie po pomiarze.
+   ================================================================ */
+static volatile uint16_t adc_wynik = 0u;
+
+/**
+ * @brief Przerwanie końca konwersji ADC.
+ * Odczytuje 10-bitowy wynik pomiaru napiecia (0-1023).
+ */
+ISR(ADC_vect) {
+    // Odczyt makra ADC z automatu pobiera najpierw ADCL, potem ADCH
+    adc_wynik = ADC; 
+}
+
+static void adc_init(void) {
+    // 1. Odłączenie cyfrowego bufora wejściowego dla pinu PF0 (A0)
+    DIDR0 |= (1u << ADC0D);
+    // 2. AVCC z zewnętrznym kondensatorem na pinie AREF, kanał ADC0
+    ADMUX = (1u << REFS0);
+    // 3. Włączenie ADC, włączenie przerwań, preskaler = 128
+    ADCSRA = (1u << ADEN) | (1u << ADIE) | (1u << ADPS2) | (1u << ADPS1) | (1u << ADPS0);
+}
+
+/* ================================================================
    SILNIKI
    Lewa os:  silnikA (PA0/PA1, OCR3A) + silnikD (PA6/PA7, OCR4C)
    Prawa os: silnikB (PA2/PA3, OCR4A) + silnikC (PA4/PA5, OCR4B)
@@ -519,6 +543,7 @@ static void obsluz_miganie(void) {
    ================================================================ */
 static bool     jedzie_przod              = false;
 static bool     pikniecie_trwa            = false;
+static bool     tryb_auto_drl             = false;
 
 static uint32_t czas_pomiaru              = 0u;
 static uint32_t czas_ostatniego_pikniecia = 0u;
@@ -657,11 +682,25 @@ static void handle_cmd(char c) {
             break;
 
         case 'D': case 'd':
-            if (drl_wlaczone)           drl_wylacz();           else drl_wlacz();           break;
+            tryb_auto_drl = false; // Przejście w tryb ręczny wyłącza automat
+            if (drl_wlaczone) {
+                drl_wylacz();
+            } else {
+                drl_wlacz();
+            }
+            break;
+
+        case 'A': case 'a': // Aktywacja trybu automatycznego
+            tryb_auto_drl = true;
+            info("DRL: TRYB AUTO AKTYWNY");
+            break;    
+
         case 'Q': case 'q':
             if (kierunk_lewy_wlaczony)  kierunk_lewy_wylacz();  else kierunk_lewy_wlacz();  break;
+
         case 'E': case 'e':
             if (kierunk_prawy_wlaczony) kierunk_prawy_wylacz(); else kierunk_prawy_wlacz(); break;
+
         case 'H': case 'h':
             if (awaryjne_wlaczone)      awaryjne_wylacz();      else awaryjne_wlacz();      break;
 
@@ -681,6 +720,7 @@ int main(void) {
     twi_init();
     pwm_init();
     gpio_init();
+    adc_init();
 
     lcd_init();
     pca9685_init();
@@ -694,7 +734,7 @@ int main(void) {
     stop_all();
     lcd_update();
     info("=== GOTOWY ===");
-    info("F/B/L/R/S/+/-/D/Q/E/H");
+    info("F/B/L/R/S/+/-/D/A/Q/E/H");
 
     while (1) {
         uint32_t teraz = millis();
@@ -723,6 +763,38 @@ int main(void) {
                 if ((teraz - czas_ostatniego_pikniecia) >= 80UL) {
                     tone_stop();
                     pikniecie_trwa = false;
+                }
+            }
+        }
+
+        /* Wyzwalanie i odczyt ADC (Fotorezystor) co 100ms */
+        static uint32_t czas_adc = 0u;
+        static bool jest_ciemno  = false; // Pamięć stanu otoczenia
+        
+        if ((teraz - czas_adc) >= 100UL) {
+            czas_adc = teraz;
+            // Kopiowanie wyniku z przerwania (operacja atomowa)
+            uint16_t odczyt_swiatla;
+            uint8_t sreg = SREG;
+            cli();
+            odczyt_swiatla = adc_wynik;
+            SREG = sreg;
+            // Start kolejnej konwersji ADC w tle (sprzęt sam powiadomi przez przerwanie)
+            ADCSRA |= (1u << ADSC);
+            
+            // 1. Aktualizacja wiedzy o otoczeniu (Histereza)
+            if (odczyt_swiatla > 700u) {
+                jest_ciemno = true;
+            } else if (odczyt_swiatla < 500u) {
+                jest_ciemno = false;
+            }
+            
+            // 2. Reakcja sprzętu TYLKO jeśli aktywny jest tryb AUTO
+            if (tryb_auto_drl) {
+                if (jest_ciemno && !drl_wlaczone) {
+                    drl_wlacz();
+                } else if (!jest_ciemno && drl_wlaczone) {
+                    drl_wylacz();
                 }
             }
         }
