@@ -362,44 +362,6 @@ static long sr04_measure(void) {
 }
 
 /* ================================================================
-   CZUJNIK HALLA - pomiar RPM (INT4 = PE4 = Pin2)
-   1 magnes na kole -> 1 impuls = 1 obrot
-   RPM = impulsy_w_sekundzie * 60
-   ================================================================ */
-static volatile uint16_t impulsy_halla    = 0u;
-static volatile uint32_t hall_ostatni_ms  = 0u;   /* debounce */
-static          uint32_t czas_rpm         = 0u;
-static          uint16_t aktualne_rpm     = 0u;
-
-/**
- * @brief  Przerwanie zewnetrzne INT4 (PE4/Pin2).
- *         Debounce 5ms — odrzuca falszywe impulsy od zaklocen EMI
- *         silnika D (PWM switching noise na kablu czujnika).
- *         ms_count jest bezpieczny do odczytu w ISR bo TIMER0 nie
- *         moze przerywac INT4 (przerwania nie sa zagniezdzone).
- */
-ISR(INT4_vect) {
-    uint32_t teraz = ms_count;
-    if ((teraz - hall_ostatni_ms) >= 5u) {
-        impulsy_halla++;
-        hall_ostatni_ms = teraz;
-    }
-}
-
-/**
- * @brief  Inicjalizacja INT4 na zbocze opadajace z pull-up.
- *         EICRB: ISC41=1 ISC40=0 -> falling edge.
- */
-static void hall_init(void) {
-    DDRE  &= ~(1u << PE4);
-    PORTE |=  (1u << PE4);
-    EICRB |=  (1u << ISC41);
-    EICRB &= ~(1u << ISC40);
-    EIFR   = (1u << INTF4);
-    EIMSK |= (1u << INT4);
-}
-
-/* ================================================================
    SILNIKI
    Lewa os:  silnikA (PA0/PA1, OCR3A) + silnikD (PA6/PA7, OCR4C)
    Prawa os: silnikB (PA2/PA3, OCR4A) + silnikC (PA4/PA5, OCR4B)
@@ -568,7 +530,7 @@ static char prev_kierunek[17]     = "";
 static char ostatni_ruch           = 'S';
 
 /* poprzednie wartosci do detekcji zmian na LCD */
-static uint16_t prev_rpm_lcd = 0xFFFFu;
+static long prev_odleglosc_lcd = -1L;
 
 /* ================================================================
    AKTUALIZACJA LCD
@@ -599,22 +561,38 @@ static void lcd_update(void) {
         lcd_puts_w(aktualny_kierunek, 10u);   /* 10 = 16 - 6 */
         strcpy(prev_kierunek, aktualny_kierunek);
     }
-    /* linia 1 - "RPM:  " (6) + liczba dopelniana spacjami do 10 = 16 */
-    if (aktualne_rpm != prev_rpm_lcd) {
+/* linia 1 - "Dyst: " (6) + liczba dopelniana spacjami do 10 = 16 */
+    if (odleglosc_cm != prev_odleglosc_lcd) {
         char buf[11];
-        uint8_t i = 0u;
-        uint16_t v = aktualne_rpm;
-        if (v == 0u) { buf[i++] = '0'; }
-        else { while (v > 0u) { buf[i++] = (char)('0' + (v % 10u)); v /= 10u; } }
-        /* odwroc cyfry */
-        for (uint8_t a = 0u, b = (uint8_t)(i - 1u); a < b; a++, b--) {
-            char tmp = buf[a]; buf[a] = buf[b]; buf[b] = tmp;
+        // Zabezpieczenie przed brakiem echa (999 oznacza brak przeszkody)
+        if (odleglosc_cm == 999L) {
+            strcpy(buf, "Brak/Max");
+        } else {
+            uint8_t i = 0u;
+            long v = odleglosc_cm;
+            // Konwersja liczby na string (itoa)
+            if (v == 0L) { 
+                buf[i++] = '0'; 
+            } else { 
+                while (v > 0L) { 
+                    buf[i++] = (char)('0' + (v % 10L)); 
+                    v /= 10L; 
+                } 
+            }
+            // Odwrócenie cyfr
+            for (uint8_t a = 0u, b = (uint8_t)(i - 1u); a < b; a++, b--) {
+                char tmp = buf[a]; buf[a] = buf[b]; buf[b] = tmp;
+            }
+            // Dopisywanie jednostki " cm"
+            buf[i++] = ' ';
+            buf[i++] = 'c';
+            buf[i++] = 'm';
+            buf[i] = '\0';
         }
-        buf[i] = '\0';
         lcd_goto(0u, 1u);
-        lcd_puts("RPM:  ");
+        lcd_puts("Dyst: ");
         lcd_puts_w(buf, 10u);
-        prev_rpm_lcd = aktualne_rpm;
+        prev_odleglosc_lcd = odleglosc_cm;
     }
 }
 
@@ -703,7 +681,6 @@ int main(void) {
     twi_init();
     pwm_init();
     gpio_init();
-    hall_init();   /* czujnik Halla INT4 */
 
     lcd_init();
     pca9685_init();
@@ -748,19 +725,6 @@ int main(void) {
                     pikniecie_trwa = false;
                 }
             }
-        }
-
-        /* obliczanie RPM co 1000ms — atomowy odczyt licznika Halla */
-        if ((teraz - czas_rpm) >= 1000UL) {
-            czas_rpm = teraz;
-            uint8_t  sreg = SREG;
-            uint16_t kopia;
-            cli();
-            kopia = impulsy_halla;
-            impulsy_halla = 0u;
-            SREG = sreg;
-            /* 1 magnes na kole -> 1 impuls = 1 obrot; *60 -> RPM */
-            aktualne_rpm = (uint16_t)((uint32_t)kopia * 60u);
         }
 
         /* aktualizacja LCD przy kazdej zmianie (wewnetrzne porownanie
