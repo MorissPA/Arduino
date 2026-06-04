@@ -1,6 +1,6 @@
 /*
  * SAMOCHODZIK — Bare Metal ATmega2560
- * Bluetooth HC-05 + 2x L298N + LCD I2C + HC-SR04 + Buzzer + LED + PCA9685
+ * Bluetooth HC-05 + 2x L298N + LCD I2C + HC-SR04 + Buzzer + PCA9685 + ADC
  *
  * Piny:
  *   HC-05:    UART1 TX=Pin19(PD3) RX=Pin18(PD2)
@@ -8,43 +8,43 @@
  *             ENB=Pin6(PH3/OC4A)  IN3=24(PA2) IN4=25(PA3)
  *   L298N #2: ENC=Pin7(PH4/OC4B)  IN5=26(PA4) IN6=27(PA5)
  *             END=Pin8(PH5/OC4C)  IN7=28(PA6) IN8=29(PA7)
- *   LCD I2C:  SDA=Pin20 SCL=Pin21, PCF8574T addr=0x27
+ *   LCD I2C:  SDA=Pin20  SCL=Pin21  PCF8574T addr=0x27
  *   PCA9685:  ten sam I2C, addr=0x40
- *             kanal 0 = DRL lewy (bialy)
- *             kanal 1 = DRL prawy (bialy)
- *             kanal 2 = kierunkowskaz lewy (zolty)
- *             kanal 3 = kierunkowskaz prawy (zolty)
+ *             kanal 0=DRL lewy (bialy)   kanal 1=DRL prawy (bialy)
+ *             kanal 2=kier. lewy (zolty) kanal 3=kier. prawy (zolty)
  *   HC-SR04:  TRIG=Pin38(PD7)  ECHO=Pin48(PL1/ICP5)
  *   Buzzer:   Pin13(PB5/OC1A)
  *   LED:      Pin46(PL3)
- *   Hall:     PE4 = Pin2 (INT4)
+ *   Foto:     Pin A0 (PF0/ADC0) — fotorezystor do auto-DRL
  *
  * Timery:
- *   Timer0: CTC 1ms -> millis()
+ *   Timer0: CTC 1ms  -> millis()
  *   Timer1: CTC toggle OC1A -> buzzer (Pin13/PB5)
- *   Timer3: Fast PWM 8-bit -> ENA (Pin5/PE3)
- *   Timer4: Fast PWM 8-bit -> ENB(6) ENC(7) END(8)
- *   Timer5: Input Capture -> pomiar HC-SR04 asynchroniczny (ICP5=PL1=Pin48)
+ *   Timer3: Fast PWM 8-bit  -> ENA (Pin5/PE3)
+ *   Timer4: Fast PWM 8-bit  -> ENB(6) ENC(7) END(8)
+ *   Timer5: Input Capture   -> pomiar HC-SR04 async (ICP5=PL1=Pin48)
  *
- * Skret - skid-steer pivot:
- *   Lewa os:  silnikA + silnikD
- *   Prawa os: silnikB + silnikC
- *   LEWO:  lewa os do tylu, prawa do przodu
- *   PRAWO: lewa os do przodu, prawa do tylu
- *   PREDKOSC_SKRET=255 (max) - silniki TT potrzebuja pelnego
- *   momentu do pokonania tarcia bocznego przy rozstawie 16x21cm.
+ * Osie silnikow (kola mecanum X-layout):
+ *   silnikA = FL przod-lewy   (ENA=OC3A, IN1=PA0, IN2=PA1)
+ *   silnikB = FR przod-prawy  (ENB=OC4A, IN3=PA2, IN4=PA3)
+ *   silnikC = RR tyl-prawy    (ENC=OC4B, IN5=PA4, IN6=PA5)
+ *   silnikD = RL tyl-lewy     (END=OC4C, IN7=PA6, IN8=PA7)
  *
  * LCD:
  *   Linia 0: kierunek jazdy
- *   Linia 1: RPM z czujnika Halla
+ *   Linia 1: dystans HC-SR04 [cm]
  *
  * Komendy Bluetooth:
- *   F/B/L/R/S = jazda przod/tyl/lewo/prawo/stop
- *   +/-       = szybciej/wolniej (tylko jazda prosto/wstecz)
- *   D         = DRL wlacz/wylacz
- *   Q         = lewy kierunkowskaz wlacz/wylacz
- *   E         = prawy kierunkowskaz wlacz/wylacz
- *   H         = awaryjne wlacz/wylacz
+ *   F/B     = przod / tyl
+ *   L/R     = obrot pivot lewo / prawo
+ *   X/Y     = jazda bokiem lewo / prawo  (strafe mecanum)
+ *   I/K     = skos przod-lewo / przod-prawo (diagonal mecanum)
+ *   S       = stop
+ *   +/-     = szybciej / wolniej
+ *   D       = DRL wlacz/wylacz (tryb reczny)
+ *   A       = DRL tryb auto (fotorezystor)
+ *   Q/E     = kierunkowskaz lewy / prawy
+ *   H       = swiatla awaryjne
  */
 
 #include <avr/io.h>
@@ -56,13 +56,8 @@
 
 #define F_CPU 16000000UL
 
-/* Predkosc obrotu zawsze maksymalna — silniki TT przy rozstawie
- * 16x21 cm potrzebuja pelnego momentu do pivot-turn. */
-#define PREDKOSC_SKRET 255u
-
 /* ================================================================
-   MILLIS - Timer0 CTC
-   Prescaler 64, OCR0A=249 -> 1ms na przerwanie
+   MILLIS — Timer0 CTC, prescaler 64, OCR0A=249 -> 1 ms/przerwanie
    ================================================================ */
 volatile uint32_t ms_count = 0u;
 
@@ -85,8 +80,8 @@ static uint32_t millis(void) {
 }
 
 /* ================================================================
-   UART0 (USB) + UART1 (HC-05)
-   UBRR = F_CPU/(16*BAUD) - 1 = 103 dla 9600 baud @ 16MHz
+   UART0 (USB debug) + UART1 (HC-05 Bluetooth)
+   9600 baud @ 16 MHz  ->  UBRR = 103
    ================================================================ */
 #define BAUD     9600UL
 #define UBRR_VAL (F_CPU / (16UL * BAUD) - 1u)
@@ -129,7 +124,7 @@ static void info(const char *s) {
 }
 
 /* ================================================================
-   TWI (I2C) - 100 kHz
+   TWI (I2C) — 100 kHz
    TWBR=72, TWSR=0x00 (prescaler=1)
    ================================================================ */
 #define I2C_TIMEOUT 10000u
@@ -160,9 +155,8 @@ static bool twi_write_byte(uint8_t data) {
 }
 
 /* ================================================================
-   PCF8574T + HD44780 LCD (4-bit przez I2C)
-   Adres 0x27 -> SLA+W=0x4E
-   P0=RS P1=RW P2=EN P3=BL P4-P7=D4-D7
+   LCD HD44780 w trybie 4-bit przez PCF8574T (addr 0x27)
+   Mapowanie PCF: P0=RS P1=RW P2=EN P3=BL P4-P7=D4-D7
    ================================================================ */
 #define LCD_ADDR_W  (0x27u << 1u)
 #define LCD_RS      (1u << 0u)
@@ -177,8 +171,8 @@ static void pcf_write(uint8_t b) {
 }
 
 static void lcd_strobe(uint8_t b) {
-    pcf_write(b | LCD_EN);   _delay_us(1);
-    pcf_write(b & (uint8_t)~LCD_EN); _delay_us(50);
+    pcf_write(b | LCD_EN);              _delay_us(1);
+    pcf_write(b & (uint8_t)~LCD_EN);   _delay_us(50);
 }
 
 static void lcd_send(uint8_t byte, uint8_t rs) {
@@ -197,11 +191,11 @@ static void lcd_init(void) {
     pcf_write(0x30u | LCD_BL); lcd_strobe(0x30u | LCD_BL); _delay_us(150);
     pcf_write(0x30u | LCD_BL); lcd_strobe(0x30u | LCD_BL); _delay_us(150);
     pcf_write(0x20u | LCD_BL); lcd_strobe(0x20u | LCD_BL); _delay_us(150);
-    lcd_cmd(0x28u); _delay_us(50);
-    lcd_cmd(0x08u); _delay_us(50);
-    lcd_cmd(0x01u); _delay_ms(2);
-    lcd_cmd(0x06u); _delay_us(50);
-    lcd_cmd(0x0Cu); _delay_us(50);
+    lcd_cmd(0x28u); _delay_us(50);   /* 4-bit, 2 linie, 5x8 */
+    lcd_cmd(0x08u); _delay_us(50);   /* display off */
+    lcd_cmd(0x01u); _delay_ms(2);    /* clear */
+    lcd_cmd(0x06u); _delay_us(50);   /* entry mode: cursor right */
+    lcd_cmd(0x0Cu); _delay_us(50);   /* display on, cursor off */
 }
 
 static void lcd_clear(void) { lcd_cmd(0x01u); _delay_ms(2); }
@@ -215,24 +209,17 @@ static void lcd_puts(const char *s) {
     while (*s) { lcd_chr((uint8_t)*s++); _delay_us(50); }
 }
 
-static void lcd_putn(int32_t n) {
-    char buf[12]; int8_t i = 0;
-    if (n < 0) { lcd_chr('-'); n = -n; }
-    if (n == 0) { lcd_chr('0'); return; }
-    while (n > 0) { buf[i++] = (char)('0' + (n % 10)); n /= 10; }
-    while (i > 0) { lcd_chr((uint8_t)buf[--i]); }
-}
-
-static void lcd_puts_pad(const char *s) {
-    uint8_t len = (uint8_t)strlen(s);
-    if (len > 16u) len = 16u;
-    lcd_puts(s);
-    for (uint8_t i = len; i < 16u; i++) { lcd_chr(' '); }
+/* Wypisuje string i dopelnia spacjami do zadanej szerokosci.
+   Zapobiega „smugom" po krotszych napisach bez lcd_clear(). */
+static void lcd_puts_w(const char *s, uint8_t szerokosc) {
+    uint8_t n = 0u;
+    while (*s && n < szerokosc) { lcd_chr((uint8_t)*s++); _delay_us(50); n++; }
+    while (n < szerokosc)       { lcd_chr(' ');            _delay_us(50); n++; }
 }
 
 /* ================================================================
-   PCA9685 - ekspander PWM (LEDy kanaly 0-3)
-   Adres 0x40, MODE1=0x21 (AI=1), LED0_ON_L=0x06
+   PCA9685 — ekspander PWM dla LED (kanaly 0-3)
+   addr=0x40, tryb AI (auto-increment), czestotliwosc domyslna ~200Hz
    ================================================================ */
 #define PCA_ADDR_W  (0x40u << 1u)
 #define PCA_MODE1   0x00u
@@ -242,7 +229,7 @@ static void pca9685_init(void) {
     if (!twi_start()) return;
     (void)twi_write_byte(PCA_ADDR_W);
     (void)twi_write_byte(PCA_MODE1);
-    (void)twi_write_byte(0x21u);
+    (void)twi_write_byte(0x21u);   /* SLEEP=0, AI=1 */
     twi_stop();
     _delay_ms(1);
 }
@@ -250,7 +237,7 @@ static void pca9685_init(void) {
 static void pca_set(uint8_t ch, uint16_t on, uint16_t off) {
     if (!twi_start()) return;
     (void)twi_write_byte(PCA_ADDR_W);
-    (void)twi_write_byte(PCA_LED0 + 4u * ch);
+    (void)twi_write_byte((uint8_t)(PCA_LED0 + 4u * ch));
     (void)twi_write_byte((uint8_t)(on  & 0xFFu));
     (void)twi_write_byte((uint8_t)(on  >> 8u));
     (void)twi_write_byte((uint8_t)(off & 0xFFu));
@@ -278,11 +265,9 @@ static void pwm_init(void) {
 
 /* ================================================================
    GPIO
-   Silniki: PORTA PA0-PA7 = Piny 22-29
-   Buzzer:  PB5 = Pin13
-   LED:     PL3 = Pin46
-   SR04:    TRIG=PD7=Pin38, ECHO=PL1=Pin48 (ICP5)
-   Hall:    PE4 = Pin2 (INT4, wejscie z pull-up)
+   Kierunki silnikow: PORTA PA0-PA7 = Piny 22-29
+   Buzzer:  PB5=Pin13   LED: PL3=Pin46
+   SR04:    TRIG=PD7=Pin38  ECHO=PL1=Pin48
    ================================================================ */
 static void gpio_init(void) {
     DDRA  = 0xFFu; PORTA = 0x00u;
@@ -293,8 +278,8 @@ static void gpio_init(void) {
 }
 
 /* ================================================================
-   BUZZER - Timer1 CTC, toggle OC1A=PB5=Pin13
-   OCR1A = F_CPU/(2*8*freq) - 1
+   BUZZER — Timer1 CTC toggle OC1A=PB5=Pin13
+   OCR1A = F_CPU / (2 * prescaler * freq) - 1
    ================================================================ */
 static void tone_start(uint16_t freq) {
     uint32_t ocr = F_CPU / (2UL * 8UL * (uint32_t)freq) - 1UL;
@@ -311,26 +296,23 @@ static void tone_stop(void) {
 }
 
 /* ================================================================
-   HC-SR04 - asynchroniczny pomiar przez Timer5 Input Capture
-   ICP5=PL1=Pin48, prescaler 8 -> 0.5us/tick
+   HC-SR04 — asynchroniczny pomiar Input Capture Timer5
+   ICP5=PL1=Pin48, prescaler 8 -> 0.5 us/tick
    Odleglosc [cm] = tiki / 116
    ================================================================ */
 static volatile uint16_t sr04_start     = 0u;
 static volatile long     sr04_odleglosc = 999L;
 static volatile bool     sr04_w_trakcie = false;
 
-/**
- * @brief  Przerwanie Input Capture Timer5.
- *         Zbocze narastajace: zapis czasu startu echa.
- *         Zbocze opadajace:   obliczenie odleglosci.
- */
 ISR(TIMER5_CAPT_vect) {
     uint16_t teraz = ICR5;
     if (TCCR5B & (1u << ICES5)) {
+        /* zbocze narastajace: zapisz czas startu echa */
         sr04_start = teraz;
         TCCR5B &= ~(1u << ICES5);
         TIFR5   = (1u << ICF5);
     } else {
+        /* zbocze opadajace: oblicz dystans */
         uint16_t dt = teraz - sr04_start;
         long d = (long)dt / 116L;
         sr04_odleglosc = (d > 400L) ? 999L : d;
@@ -340,12 +322,9 @@ ISR(TIMER5_CAPT_vect) {
     }
 }
 
-/**
- * @brief  Wyzwala impuls TRIG i startuje asynchroniczny pomiar.
- * @return Ostatnio zmierzona odleglosc [cm] lub 999.
- */
 static long sr04_measure(void) {
     if (sr04_w_trakcie) {
+        /* poprzedni pomiar nie skonczony — resetuj */
         TCCR5B  = 0u;
         TIMSK5 &= ~(1u << ICIE5);
         sr04_w_trakcie = false;
@@ -358,77 +337,55 @@ static long sr04_measure(void) {
     TIFR5  = (1u << ICF5);
     TIMSK5 |= (1u << ICIE5);
     TCCR5B  = (1u << ICNC5) | (1u << ICES5) | (1u << CS51);
-    return sr04_odleglosc;
+    return sr04_odleglosc;   /* zwraca ostatni wynik; nowy bedzie po ~150ms */
 }
 
 /* ================================================================
-   FOTOREZYSTOR (ADC) - Automatyczne DRL (Pin PF0 / A0)
-   ADC0, preskaler 128, AVCC jako referencja, przerwanie po pomiarze.
+   ADC — fotorezystor (PF0/A0) do auto-DRL
+   AVCC jako referencja, preskaler 128, przerwanie po konwersji
    ================================================================ */
 static volatile uint16_t adc_wynik = 0u;
 
-/**
- * @brief Przerwanie końca konwersji ADC.
- * Odczytuje 10-bitowy wynik pomiaru napiecia (0-1023).
- */
 ISR(ADC_vect) {
-    // Odczyt makra ADC z automatu pobiera najpierw ADCL, potem ADCH
-    adc_wynik = ADC; 
+    adc_wynik = ADC;   /* makro ADC czyta ADCL+ADCH w kolejnosci */
 }
 
 static void adc_init(void) {
-    // 1. Odłączenie cyfrowego bufora wejściowego dla pinu PF0 (A0)
-    DIDR0 |= (1u << ADC0D);
-    // 2. AVCC z zewnętrznym kondensatorem na pinie AREF, kanał ADC0
-    ADMUX = (1u << REFS0);
-    // 3. Włączenie ADC, włączenie przerwań, preskaler = 128
-    ADCSRA = (1u << ADEN) | (1u << ADIE) | (1u << ADPS2) | (1u << ADPS1) | (1u << ADPS0);
+    DIDR0  |= (1u << ADC0D);                              /* wylacz bufor cyfrowy PF0 */
+    ADMUX   = (1u << REFS0);                              /* AVCC, kanal ADC0 */
+    ADCSRA  = (1u << ADEN) | (1u << ADIE)                /* wlacz ADC + przerwanie */
+            | (1u << ADPS2) | (1u << ADPS1) | (1u << ADPS0); /* preskaler 128 */
 }
 
 /* ================================================================
-   SILNIKI
-   Lewa os:  silnikA (PA0/PA1, OCR3A) + silnikD (PA6/PA7, OCR4C)
-   Prawa os: silnikB (PA2/PA3, OCR4A) + silnikC (PA4/PA5, OCR4B)
-   k>0=przod  k<0=tyl  k=0=stop   spd=PWM 0-255
+   SILNIKI — kola mecanum X-layout
+   k > 0 = "przod" w sensie okablowania  k < 0 = "tyl"  k = 0 = stop
+   Uwaga: w tym projekcie k=-1 odpowiada fizycznej jeździe DO PRZODU.
    ================================================================ */
 static uint8_t predkosc = 200u;
 
-/**
- * @brief  Silnik A - przod-lewy (ENA=OCR3A, IN1=PA0, IN2=PA1).
- * @param  k    Kierunek: >0 przod, <0 tyl, 0 stop.
- * @param  spd  Wartosc PWM 0-255.
- */
-static void silnikA(int8_t k, uint8_t spd) {
+static void silnikA(int8_t k, uint8_t spd) {   /* FL przod-lewy */
     if      (k > 0) { PORTA |=  (1u<<PA0); PORTA &= ~(1u<<PA1); }
     else if (k < 0) { PORTA &= ~(1u<<PA0); PORTA |=  (1u<<PA1); }
     else            { PORTA &= ~((1u<<PA0)|(1u<<PA1)); }
     OCR3A = (k != 0) ? spd : 0u;
 }
 
-/**
- * @brief  Silnik B - przod-prawy (ENB=OCR4A, IN3=PA2, IN4=PA3).
- */
-static void silnikB(int8_t k, uint8_t spd) {
+static void silnikB(int8_t k, uint8_t spd) {   /* FR przod-prawy */
     if      (k > 0) { PORTA |=  (1u<<PA2); PORTA &= ~(1u<<PA3); }
     else if (k < 0) { PORTA &= ~(1u<<PA2); PORTA |=  (1u<<PA3); }
     else            { PORTA &= ~((1u<<PA2)|(1u<<PA3)); }
     OCR4A = (k != 0) ? spd : 0u;
 }
 
-/**
- * @brief  Silnik C - tyl-prawy (ENC=OCR4B, IN5=PA4, IN6=PA5).
- */
-static void silnikC(int8_t k, uint8_t spd) {
+static void silnikC(int8_t k, uint8_t spd) {   /* RR tyl-prawy */
     if      (k > 0) { PORTA |=  (1u<<PA4); PORTA &= ~(1u<<PA5); }
     else if (k < 0) { PORTA &= ~(1u<<PA4); PORTA |=  (1u<<PA5); }
     else            { PORTA &= ~((1u<<PA4)|(1u<<PA5)); }
     OCR4B = (k != 0) ? spd : 0u;
 }
 
-/**
- * @brief  Silnik D - tyl-lewy (END=OCR4C, IN7=PA6, IN8=PA7).
- */
-static void silnikD(int8_t k, uint8_t spd) {
+static void silnikD(int8_t k, uint8_t spd) {   /* RL tyl-lewy */
     if      (k > 0) { PORTA |=  (1u<<PA6); PORTA &= ~(1u<<PA7); }
     else if (k < 0) { PORTA &= ~(1u<<PA6); PORTA |=  (1u<<PA7); }
     else            { PORTA &= ~((1u<<PA6)|(1u<<PA7)); }
@@ -440,8 +397,8 @@ static void stop_all(void) {
 }
 
 /* ================================================================
-   LEDY PCA9685
-   kanal 0=DRL lewy  1=DRL prawy  2=kier.lewy  3=kier.prawy
+   OSWIETLENIE — PCA9685 kanaly 0-3
+   0=DRL lewy  1=DRL prawy  2=kier. lewy  3=kier. prawy
    ================================================================ */
 #define KANAL_DRL_LEWY      0u
 #define KANAL_DRL_PRAWY     1u
@@ -451,10 +408,10 @@ static void stop_all(void) {
 #define JASNOSC_ZERO        0u
 #define OKRES_PULSOWANIA_MS 1000u
 
-static bool     drl_wlaczone           = false;
-static bool     kierunk_lewy_wlaczony  = false;
-static bool     kierunk_prawy_wlaczony = false;
-static bool     awaryjne_wlaczone      = false;
+static bool     drl_wlaczone            = false;
+static bool     kierunk_lewy_wlaczony   = false;
+static bool     kierunk_prawy_wlaczony  = false;
+static bool     awaryjne_wlaczone       = false;
 static uint32_t czas_ostatniego_i2c_mig = 0u;
 
 static void ustaw_kanal(uint8_t kanal, bool wlaczony) {
@@ -511,10 +468,7 @@ static void awaryjne_wylacz(void) {
     info("AWARYJNE: WYLACZONE");
 }
 
-/**
- * @brief  Plynne pulsowanie kierunkowskazow (50 Hz, cykl 1s).
- *         Ogranicza zapisy I2C do co 20ms.
- */
+/* Plynne pulsowanie kierunkowskazow (trójkatne, cykl 1s, max 50 Hz I2C). */
 static void obsluz_miganie(void) {
     if (!kierunk_lewy_wlaczony && !kierunk_prawy_wlaczony && !awaryjne_wlaczone) return;
     uint32_t teraz = millis();
@@ -522,12 +476,9 @@ static void obsluz_miganie(void) {
     czas_ostatniego_i2c_mig = teraz;
 
     uint32_t t = teraz % OKRES_PULSOWANIA_MS;
-    uint16_t jasnosc;
-    if (t < (OKRES_PULSOWANIA_MS / 2u)) {
-        jasnosc = (uint16_t)((uint32_t)t * 4095UL / (OKRES_PULSOWANIA_MS / 2u));
-    } else {
-        jasnosc = (uint16_t)((OKRES_PULSOWANIA_MS - t) * 4095UL / (OKRES_PULSOWANIA_MS / 2u));
-    }
+    uint16_t jasnosc = (t < (OKRES_PULSOWANIA_MS / 2u))
+        ? (uint16_t)((uint32_t)t * 4095UL / (OKRES_PULSOWANIA_MS / 2u))
+        : (uint16_t)((OKRES_PULSOWANIA_MS - t) * 4095UL / (OKRES_PULSOWANIA_MS / 2u));
 
     if (awaryjne_wlaczone) {
         pca_set(KANAL_KIERUNK_LEWY,  0u, jasnosc);
@@ -541,78 +492,52 @@ static void obsluz_miganie(void) {
 /* ================================================================
    STAN GLOBALNY
    ================================================================ */
-static bool     jedzie_przod              = false;
 static bool     pikniecie_trwa            = false;
 static bool     tryb_auto_drl             = false;
 
 static uint32_t czas_pomiaru              = 0u;
 static uint32_t czas_ostatniego_pikniecia = 0u;
 
-static long     odleglosc_cm = 999L;
+static long     odleglosc_cm              = 999L;
 
-static char aktualny_kierunek[17] = "STOP";
-static char prev_kierunek[17]     = "";
-static char ostatni_ruch           = 'S';
+static char     aktualny_kierunek[17]     = "STOP";
+static char     prev_kierunek[17]         = "";
+static char     ostatni_ruch              = 'S';
 
-/* poprzednie wartosci do detekcji zmian na LCD */
-static long prev_odleglosc_lcd = -1L;
+static long     prev_odleglosc_lcd        = -1L;
 
 /* ================================================================
-   AKTUALIZACJA LCD
-   Linia 0: "Kier: XXXX      " (16 znakow lacznie)
-   Linia 1: "RPM:  XXXXX     " (16 znakow lacznie)
-   Wywolywana przy kazdej zmianie wartosci ORAZ co 150ms
-   (razem z pomiarem SR04) zeby miec pewnosc ze ekran dziala.
+   LCD — aktualizacja przy zmianie wartosci
+   Linia 0: "Kier: XXXXXXXXXX" (6 + 10 = 16)
+   Linia 1: "Dyst: XXXXXXXXXX" (6 + 10 = 16)
    ================================================================ */
-
-/**
- * @brief  Wypisuje string na LCD i dopelnia spacjami do zadanej
- *         szerokosci. Uzyj po lcd_goto(), podaj ile znakow zostalo
- *         w linii (nie dlugos stringa).
- * @param  s       String do wypisania.
- * @param  szerokosc  Ile znakow ma zająć cała kolumna.
- */
-static void lcd_puts_w(const char *s, uint8_t szerokosc) {
-    uint8_t n = 0u;
-    while (*s && n < szerokosc) { lcd_chr((uint8_t)*s++); _delay_us(50); n++; }
-    while (n < szerokosc)       { lcd_chr(' ');            _delay_us(50); n++; }
-}
-
 static void lcd_update(void) {
-    /* linia 0 - "Kier: " (6) + kierunek dopelniany spacjami do 10 = 16 */
+    /* linia 0 — kierunek jazdy */
     if (strcmp(aktualny_kierunek, prev_kierunek) != 0) {
         lcd_goto(0u, 0u);
         lcd_puts("Kier: ");
-        lcd_puts_w(aktualny_kierunek, 10u);   /* 10 = 16 - 6 */
+        lcd_puts_w(aktualny_kierunek, 10u);
         strcpy(prev_kierunek, aktualny_kierunek);
     }
-/* linia 1 - "Dyst: " (6) + liczba dopelniana spacjami do 10 = 16 */
+
+    /* linia 1 — dystans od przeszkody */
     if (odleglosc_cm != prev_odleglosc_lcd) {
         char buf[11];
-        // Zabezpieczenie przed brakiem echa (999 oznacza brak przeszkody)
         if (odleglosc_cm == 999L) {
             strcpy(buf, "Brak/Max");
         } else {
             uint8_t i = 0u;
             long v = odleglosc_cm;
-            // Konwersja liczby na string (itoa)
-            if (v == 0L) { 
-                buf[i++] = '0'; 
-            } else { 
-                while (v > 0L) { 
-                    buf[i++] = (char)('0' + (v % 10L)); 
-                    v /= 10L; 
-                } 
+            if (v == 0L) {
+                buf[i++] = '0';
+            } else {
+                while (v > 0L) { buf[i++] = (char)('0' + (v % 10L)); v /= 10L; }
+                for (uint8_t a = 0u, b = (uint8_t)(i - 1u); a < b; a++, b--) {
+                    char tmp = buf[a]; buf[a] = buf[b]; buf[b] = tmp;
+                }
             }
-            // Odwrócenie cyfr
-            for (uint8_t a = 0u, b = (uint8_t)(i - 1u); a < b; a++, b--) {
-                char tmp = buf[a]; buf[a] = buf[b]; buf[b] = tmp;
-            }
-            // Dopisywanie jednostki " cm"
-            buf[i++] = ' ';
-            buf[i++] = 'c';
-            buf[i++] = 'm';
-            buf[i] = '\0';
+            buf[i++] = ' '; buf[i++] = 'c'; buf[i++] = 'm';
+            buf[i]   = '\0';
         }
         lcd_goto(0u, 1u);
         lcd_puts("Dyst: ");
@@ -622,51 +547,82 @@ static void lcd_update(void) {
 }
 
 /* ================================================================
-   OBSLUGA KOMENDY
+   OBSLUGA KOMEND BLUETOOTH
    ================================================================ */
 static void handle_cmd(char c) {
     switch (c) {
+
+        /* --- jazda prosto --- */
         case 'F': case 'f':
             silnikA(-1, predkosc); silnikB(-1, predkosc);
             silnikC(-1, predkosc); silnikD(-1, predkosc);
-            jedzie_przod = true;  ostatni_ruch = 'F';
+            ostatni_ruch = 'F';
             strcpy(aktualny_kierunek, "PRZOD"); info("PRZOD");
             break;
 
         case 'B': case 'b':
             silnikA(1, predkosc); silnikB(1, predkosc);
             silnikC(1, predkosc); silnikD(1, predkosc);
-            jedzie_przod = false; ostatni_ruch = 'B';
+            ostatni_ruch = 'B';
             strcpy(aktualny_kierunek, "TYL"); info("TYL");
             break;
 
-        /*
-         * LEWO: lewa os (A+D) do tylu, prawa os (B+C) do przodu.
-         * Predkosc=255 — pelny moment do pivot-turn.
-         */
+        /* --- obrot pivot (lewa os vs prawa os) --- */
         case 'L': case 'l':
-            silnikA(-1, PREDKOSC_SKRET); silnikD(-1, PREDKOSC_SKRET);
-            silnikB( 1, PREDKOSC_SKRET); silnikC( 1, PREDKOSC_SKRET);
-            jedzie_przod = false; ostatni_ruch = 'L';
+            silnikA(-1, predkosc); silnikD(-1, predkosc);
+            silnikB( 1, predkosc); silnikC( 1, predkosc);
+            ostatni_ruch = 'L';
             strcpy(aktualny_kierunek, "LEWO"); info("LEWO");
             break;
 
-        /*
-         * PRAWO: lewa os (A+D) do przodu, prawa os (B+C) do tylu.
-         */
         case 'R': case 'r':
-            silnikA( 1, PREDKOSC_SKRET); silnikD( 1, PREDKOSC_SKRET);
-            silnikB(-1, PREDKOSC_SKRET); silnikC(-1, PREDKOSC_SKRET);
-            jedzie_przod = false; ostatni_ruch = 'R';
+            silnikA( 1, predkosc); silnikD( 1, predkosc);
+            silnikB(-1, predkosc); silnikC(-1, predkosc);
+            ostatni_ruch = 'R';
             strcpy(aktualny_kierunek, "PRAWO"); info("PRAWO");
+            break;
+
+        /* --- jazda bokiem — strafe mecanum X-layout ---
+         * Strafe prawo (Y): FL=przod, FR=tyl, RL=tyl, RR=przod
+         * Strafe lewo  (X): FL=tyl,  FR=przod, RL=przod, RR=tyl  */
+        case 'X': case 'x':
+            silnikA( 1, predkosc); silnikB(-1, predkosc);
+            silnikC( 1, predkosc); silnikD(-1, predkosc);
+            ostatni_ruch = 'X';
+            strcpy(aktualny_kierunek, "BOK-LEWO"); info("BOK-LEWO");
+            break;
+
+        case 'Y': case 'y':
+            silnikA(-1, predkosc); silnikB( 1, predkosc);
+            silnikC(-1, predkosc); silnikD( 1, predkosc);
+            ostatni_ruch = 'Y';
+            strcpy(aktualny_kierunek, "BOK-PRAWO"); info("BOK-PRAWO");
+            break;
+
+        /* --- skos do przodu — diagonal mecanum X-layout ---
+         * Skos przod-lewo  (I): FR=przod, RL=przod; FL i RR stop
+         * Skos przod-prawo (K): FL=przod, RR=przod; FR i RL stop */
+        case 'I': case 'i':
+            silnikA(0, 0u);          silnikB(-1, predkosc);
+            silnikC(0, 0u);          silnikD(-1, predkosc);
+            ostatni_ruch = 'I';
+            strcpy(aktualny_kierunek, "SKOS-PL"); info("SKOS PRZOD-LEWO");
+            break;
+
+        case 'K': case 'k':
+            silnikA(-1, predkosc);   silnikB(0, 0u);
+            silnikC(-1, predkosc);   silnikD(0, 0u);
+            ostatni_ruch = 'K';
+            strcpy(aktualny_kierunek, "SKOS-PP"); info("SKOS PRZOD-PRAWO");
             break;
 
         case 'S': case 's':
             stop_all();
-            jedzie_przod = false; ostatni_ruch = 'S';
+            ostatni_ruch = 'S';
             strcpy(aktualny_kierunek, "STOP"); info("STOP");
             break;
 
+        /* --- predkosc --- */
         case '+':
             if (predkosc <= 235u) predkosc += 20u; else predkosc = 255u;
             uart0_puts("Predkosc: "); uart_putn(0, (int32_t)predkosc); uart0_puts("\r\n");
@@ -681,28 +637,28 @@ static void handle_cmd(char c) {
             handle_cmd(ostatni_ruch);
             break;
 
+        /* --- oswietlenie --- */
         case 'D': case 'd':
-            tryb_auto_drl = false; // Przejście w tryb ręczny wyłącza automat
-            if (drl_wlaczone) {
-                drl_wylacz();
-            } else {
-                drl_wlacz();
-            }
+            tryb_auto_drl = false;   /* reczne D wylacza automat */
+            if (drl_wlaczone) drl_wylacz(); else drl_wlacz();
             break;
 
-        case 'A': case 'a': // Aktywacja trybu automatycznego
+        case 'A': case 'a':
             tryb_auto_drl = true;
-            info("DRL: TRYB AUTO AKTYWNY");
-            break;    
+            info("DRL: TRYB AUTO");
+            break;
 
         case 'Q': case 'q':
-            if (kierunk_lewy_wlaczony)  kierunk_lewy_wylacz();  else kierunk_lewy_wlacz();  break;
+            if (kierunk_lewy_wlaczony)  kierunk_lewy_wylacz();  else kierunk_lewy_wlacz();
+            break;
 
         case 'E': case 'e':
-            if (kierunk_prawy_wlaczony) kierunk_prawy_wylacz(); else kierunk_prawy_wlacz(); break;
+            if (kierunk_prawy_wlaczony) kierunk_prawy_wylacz(); else kierunk_prawy_wlacz();
+            break;
 
         case 'H': case 'h':
-            if (awaryjne_wlaczone)      awaryjne_wylacz();      else awaryjne_wlacz();      break;
+            if (awaryjne_wlaczone) awaryjne_wylacz(); else awaryjne_wlacz();
+            break;
 
         default: break;
     }
@@ -734,18 +690,18 @@ int main(void) {
     stop_all();
     lcd_update();
     info("=== GOTOWY ===");
-    info("F/B/L/R/S/+/-/D/A/Q/E/H");
+    info("F/B/L/R/X/Y/I/K/S/+/-/D/A/Q/E/H");
 
     while (1) {
         uint32_t teraz = millis();
 
-        /* pomiar odleglosci co 150ms */
+        /* pomiar dystansu HC-SR04 co 150ms */
         if ((teraz - czas_pomiaru) >= 150UL) {
             czas_pomiaru = teraz;
             odleglosc_cm = sr04_measure();
         }
 
-        /* PDC - asystent parkowania */
+        /* PDC — asystent parkowania (buzzer proporcjonalny do dystansu) */
         if (odleglosc_cm > 100L || odleglosc_cm == 999L) {
             if (pikniecie_trwa) { tone_stop(); pikniecie_trwa = false; }
         } else if (odleglosc_cm <= 15L) {
@@ -767,46 +723,37 @@ int main(void) {
             }
         }
 
-        /* Wyzwalanie i odczyt ADC (Fotorezystor) co 100ms */
+        /* ADC (fotorezystor) co 100ms — auto-DRL z histereza */
         static uint32_t czas_adc = 0u;
-        static bool jest_ciemno  = false; // Pamięć stanu otoczenia
-        
+        static bool     jest_ciemno = false;
+
         if ((teraz - czas_adc) >= 100UL) {
             czas_adc = teraz;
-            // Kopiowanie wyniku z przerwania (operacja atomowa)
-            uint16_t odczyt_swiatla;
+
+            uint16_t odczyt;
             uint8_t sreg = SREG;
             cli();
-            odczyt_swiatla = adc_wynik;
+            odczyt = adc_wynik;
             SREG = sreg;
-            // Start kolejnej konwersji ADC w tle (sprzęt sam powiadomi przez przerwanie)
-            ADCSRA |= (1u << ADSC);
-            
-            // 1. Aktualizacja wiedzy o otoczeniu (Histereza)
-            if (odczyt_swiatla > 700u) {
-                jest_ciemno = true;
-            } else if (odczyt_swiatla < 500u) {
-                jest_ciemno = false;
-            }
-            
-            // 2. Reakcja sprzętu TYLKO jeśli aktywny jest tryb AUTO
+            ADCSRA |= (1u << ADSC);   /* start kolejnej konwersji */
+
+            /* histereza: wlacza przy >700, wylacza przy <500 */
+            if      (odczyt > 700u) jest_ciemno = true;
+            else if (odczyt < 500u) jest_ciemno = false;
+
             if (tryb_auto_drl) {
-                if (jest_ciemno && !drl_wlaczone) {
-                    drl_wlacz();
-                } else if (!jest_ciemno && drl_wlaczone) {
-                    drl_wylacz();
-                }
+                if  (jest_ciemno && !drl_wlaczone) drl_wlacz();
+                else if (!jest_ciemno && drl_wlaczone) drl_wylacz();
             }
         }
 
-        /* aktualizacja LCD przy kazdej zmianie (wewnetrzne porownanie
-         * chroni przed zbednymi zapisami I2C gdy nic sie nie zmienilo) */
+        /* odswiezanie LCD tylko przy zmianach wartosci */
         lcd_update();
 
-        /* miganie / pulsowanie kierunkowskazow */
+        /* pulsowanie kierunkowskazow */
         obsluz_miganie();
 
-        /* komendy Bluetooth / USB */
+        /* komendy z USB i Bluetooth */
         if (uart0_available()) { handle_cmd((char)uart0_read()); }
         if (uart1_available()) { handle_cmd((char)uart1_read()); }
     }
