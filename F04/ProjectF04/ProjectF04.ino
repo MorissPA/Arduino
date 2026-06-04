@@ -739,8 +739,8 @@ int main(void) {
             ADCSRA |= (1u << ADSC);   /* start kolejnej konwersji */
 
             /* histereza: wlacza przy >700, wylacza przy <500 */
-            if      (odczyt > 700u) jest_ciemno = true;
-            else if (odczyt < 500u) jest_ciemno = false;
+            if      (odczyt > 700u) jest_ciemno = false;
+            else if (odczyt < 500u) jest_ciemno = true;
 
             if (tryb_auto_drl) {
                 if  (jest_ciemno && !drl_wlaczone) drl_wlacz();
