@@ -355,6 +355,7 @@ static void adc_init(void) {
     ADMUX   = (1u << REFS0);                              /* AVCC, kanal ADC0 */
     ADCSRA  = (1u << ADEN) | (1u << ADIE)                /* wlacz ADC + przerwanie */
             | (1u << ADPS2) | (1u << ADPS1) | (1u << ADPS0); /* preskaler 128 */
+    ADCSRA |= (1u << ADSC);                               /* start pierwszej konwersji */
 }
 
 /* ================================================================
