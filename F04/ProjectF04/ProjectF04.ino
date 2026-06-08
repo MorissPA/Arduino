@@ -521,17 +521,17 @@ static void pca_ustaw(uint8_t kanal, uint16_t on, uint16_t off) {
  *  @side effects: ustawia TCCR3A, TCCR3B, TCCR4A, TCCR4B, DDRE, DDRH.
  */
 static void pwm_init(void) {
+  DDRE |= (uint8_t)(1U << PE3);
   TCCR3A = (uint8_t)((1U << COM3A1) | (1U << WGM30));
   TCCR3B = (uint8_t)((1U << WGM32) | (1U << CS31));
   OCR3A = 0U;
-  DDRE |= (uint8_t)(1U << PE3);
 
+  DDRH |= (uint8_t)((1U << PH3) | (1U << PH4) | (1U << PH5));
   TCCR4A = (uint8_t)((1U << COM4A1) | (1U << COM4B1) | (1U << COM4C1) | (1U << WGM40));
   TCCR4B = (uint8_t)((1U << WGM42) | (1U << CS41));
   OCR4A = 0U;
   OCR4B = 0U;
   OCR4C = 0U;
-  DDRH |= (uint8_t)((1U << PH3) | (1U << PH4) | (1U << PH5));
 }
 
 /* GPIO - kierunki i stany początkowe pinów */
