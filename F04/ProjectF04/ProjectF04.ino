@@ -548,9 +548,6 @@ static void gpio_init(void) {
   DDRB |= (uint8_t)(1U << PB5);
   PORTB &= (uint8_t)(~(uint8_t)(1U << PB5));
 
-  DDRL |= (uint8_t)(1U << PL3);
-  PORTL &= (uint8_t)(~(uint8_t)(1U << PL3));
-
   DDRD |= (uint8_t)(1U << PD7);
   PORTD &= (uint8_t)(~(uint8_t)(1U << PD7));
 
